@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#161823">
+  <title>抖音下载站</title>
+  <link rel="stylesheet" href="/static/app.css?v=7">
+</head>
+<body>
+  <main class="page">
+    <header class="brand">
+      <h1>抖音下载站</h1>
+      <p class="slogan">粘贴分享文案，下载无水印视频 / 图文</p>
+    </header>
+
+    <section id="view-login" class="card hidden">
+      <label class="field-label" for="password">访问密码</label>
+      <input id="password" type="password" placeholder="请输入访问密码"
+             autocomplete="current-password" enterkeyhint="go">
+      <button id="btn-login" class="btn primary" type="button">进入</button>
+      <p id="login-error" class="error hidden"></p>
+    </section>
+
+    <section id="view-main" class="card hidden">
+      <label class="field-label" for="share-text">分享文案 / 链接（可粘贴多条）</label>
+      <textarea id="share-text" rows="5"
+                placeholder="例如：7.94 复制打开抖音，看看【xxx的作品】 https://v.douyin.com/xxxx/&#10;支持一次粘贴多条链接，逐条解析"></textarea>
+      <button id="btn-parse" class="btn primary" type="button">解 析</button>
+      <p id="parse-error" class="error hidden"></p>
+    </section>
+
+    <section id="view-result" class="hidden">
+      <p id="result-summary" class="summary"></p>
+      <div id="result-list" class="result-list"></div>
+      <button id="btn-again" class="btn ghost" type="button">再解析一批</button>
+    </section>
+
+    <footer class="foot">个人家庭专用 · 请勿公开传播</footer>
+  </main>
+  <script src="/static/app.js?v=7"></script>
+</body>
+</html>

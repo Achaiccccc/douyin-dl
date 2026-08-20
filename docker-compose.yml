@@ -1,0 +1,14 @@
+services:
+  douyin-dl:
+    build: .
+    container_name: douyin-dl
+    restart: unless-stopped
+    ports:
+      - "18080:8080"
+    environment:
+      TZ: Asia/Shanghai
+      # 示例访问密码，本地试用可直接用；若会暴露到公网，请改成自己的强密码
+      APP_PASSWORD: "123456"
+      COOKIE_FILE: /data/cookie.txt
+    volumes:
+      - ./data/cookie.txt:/data/cookie.txt:ro
