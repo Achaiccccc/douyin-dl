@@ -328,6 +328,15 @@
           grid.appendChild(cell);
         });
         body.appendChild(grid);
+
+        var downloadAll = document.createElement("button");
+        downloadAll.className = "btn primary btn-download-all";
+        downloadAll.type = "button";
+        downloadAll.textContent = "下载全部";
+        downloadAll.addEventListener("click", function () {
+          downloadAllImages(item.images, downloadAll);
+        });
+        body.appendChild(downloadAll);
       } else {
         var download = document.createElement("a");
         download.className = "btn primary small";
@@ -363,6 +372,71 @@
       card.appendChild(failBody);
     }
     return card;
+  }
+
+  function filenameFromDisposition(header, fallback) {
+    if (!header) return fallback;
+    var star = /filename\*=UTF-8''([^;]+)/i.exec(header);
+    if (star) {
+      try {
+        return decodeURIComponent(star[1].trim());
+      } catch (e) {}
+    }
+    var quoted = /filename="([^"]+)"/i.exec(header);
+    if (quoted) return quoted[1];
+    var plain = /filename=([^;]+)/i.exec(header);
+    if (plain) return plain[1].trim().replace(/^["']|["']$/g, "");
+    return fallback;
+  }
+
+  function downloadBlob(url, fallbackName) {
+    return fetch(url, { credentials: "same-origin" }).then(function (resp) {
+      if (!resp.ok) throw new Error("下载失败");
+      var name = filenameFromDisposition(
+        resp.headers.get("Content-Disposition"),
+        fallbackName
+      );
+      return resp.blob().then(function (blob) {
+        var objectUrl = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = objectUrl;
+        a.download = name;
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () {
+          URL.revokeObjectURL(objectUrl);
+        }, 4000);
+      });
+    });
+  }
+
+  function downloadAllImages(images, btn) {
+    if (!images || !images.length || btn.disabled) return;
+    var i = 0;
+    var failed = 0;
+    btn.disabled = true;
+    function next() {
+      if (i >= images.length) {
+        btn.disabled = false;
+        btn.textContent = failed
+          ? "下载全部（失败 " + failed + " 张）"
+          : "下载全部";
+        return;
+      }
+      btn.textContent = "下载中 " + (i + 1) + "/" + images.length;
+      var fallback = "image-" + String(i + 1).padStart(2, "0");
+      downloadBlob(images[i].url, fallback)
+        .catch(function () {
+          failed += 1;
+        })
+        .then(function () {
+          i += 1;
+          setTimeout(next, 500);
+        });
+    }
+    next();
   }
 
   function doRetry(index, btn) {
