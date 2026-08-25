@@ -288,6 +288,19 @@ textarea:focus {
   font-size: 13px;
 }
 
+.item-images .btn-download-all {
+  width: 100%;
+  align-self: stretch;
+  padding: 10px 0;
+  font-size: 14px;
+  margin-top: 4px;
+}
+
+.item-images .btn-download-all[disabled] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 #view-result {
   display: flex;
   flex-direction: column;

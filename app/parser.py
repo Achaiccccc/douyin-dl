@@ -50,7 +50,7 @@ _RENDER_DATA_RE = re.compile(
     r'<script id="RENDER_DATA" type="application/json">(.*?)</script>', re.DOTALL
 )
 
-MAX_BATCH = 20
+MAX_BATCH = 30
 MAX_CONCURRENCY = 2
 # 批量时每条请求前的随机间隔，降低触发抖音风控的概率
 BATCH_DELAY_RANGE = (0.3, 1.0)
