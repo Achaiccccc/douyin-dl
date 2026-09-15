@@ -34,8 +34,11 @@
 
 
 import asyncio  # 异步I/O
+import logging
 import os  # 系统操作
+import re
 import time  # 时间操作
+from dataclasses import dataclass
 from urllib.parse import urlencode, quote  # URL编码
 import yaml  # 配置文件
 
@@ -66,6 +69,302 @@ path = os.path.abspath(os.path.dirname(__file__))
 with open(f"{path}/config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
+logger = logging.getLogger("douyin-dl.web_api")
+WEB_API_ATTEMPTS = 3  # 首次 + 重新签名最多 2 次
+
+
+@dataclass(frozen=True)
+class BrowserProfile:
+    impersonate: str
+    ua: str
+    browser_version: str
+    engine_version: str
+    browser_name: str = "Chrome"
+    engine_name: str = "Blink"
+
+
+CHROME131 = BrowserProfile(
+    impersonate="chrome131",
+    ua=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    browser_version="131.0.0.0",
+    engine_version="131.0.0.0",
+)
+CHROME124 = BrowserProfile(
+    impersonate="chrome124",
+    ua=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    browser_version="124.0.0.0",
+    engine_version="124.0.0.0",
+)
+CHROME90 = BrowserProfile(
+    impersonate="",
+    ua=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
+    ),
+    browser_version="90.0.4430.212",
+    engine_version="90.0.4430.212",
+)
+SAFARI184 = BrowserProfile(
+    impersonate="safari184",
+    ua=(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15"
+    ),
+    browser_version="18.4",
+    engine_version="18.4",
+    browser_name="Safari",
+    engine_name="WebKit",
+)
+PROFILES = {
+    "chrome131": CHROME131,
+    "chrome124": CHROME124,
+    "chrome90": CHROME90,
+    "safari184": SAFARI184,
+    "safari18_4": SAFARI184,
+}
+
+# 同一浏览器指纹的别名：curl_cffi 版本不同，名称可能是 safari184 / safari18_0
+IMPERSONATE_ALIASES = {
+    "chrome131": ["chrome131"],
+    "chrome124": ["chrome124", "chrome123"],
+    "safari184": ["safari184", "safari18_4", "safari18_0", "safari17_0"],
+}
+
+
+class WebApiError(Exception):
+    def __init__(self, kind: str, message: str, status: int | None = None):
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+
+
+def cookie_value(cookie: str, name: str) -> str:
+    if not cookie:
+        return ""
+    prefix = name.lower() + "="
+    for part in cookie.split(";"):
+        item = part.strip()
+        if item.lower().startswith(prefix):
+            return item.split("=", 1)[1]
+    return ""
+
+
+def resolve_ms_token(cookie: str) -> tuple[str, str]:
+    token = cookie_value(cookie, "msToken")
+    if token:
+        return token, "cookie"
+    try:
+        token = TokenManager.gen_real_msToken()
+        if token:
+            return token, "generated"
+    except Exception as exc:
+        logger.warning("生成 msToken 失败: %s", exc)
+    return "", "missing"
+
+
+def active_profile(has_cffi: bool) -> BrowserProfile:
+    name = os.environ.get("DOUYIN_IMPERSONATE", "").strip().lower()
+    if name and name in PROFILES:
+        return PROFILES[name]
+    return CHROME131 if has_cffi else CHROME90
+
+
+def api_profile_chain(has_cffi: bool) -> list[BrowserProfile]:
+    """容器内按设计试 3 档；环境变量锁死后只打那一档。"""
+    if not has_cffi:
+        return [CHROME90]
+    locked = os.environ.get("DOUYIN_IMPERSONATE", "").strip().lower()
+    if locked:
+        if locked in PROFILES:
+            return [PROFILES[locked]]
+        logger.warning("未知 DOUYIN_IMPERSONATE=%s，改走默认链", locked)
+    return [CHROME131, CHROME124, SAFARI184]
+
+
+def impersonate_names(profile: BrowserProfile) -> list[str]:
+    name = profile.impersonate
+    if not name:
+        return []
+    aliases = IMPERSONATE_ALIASES.get(name, [name])
+    seen: list[str] = []
+    for item in aliases:
+        if item not in seen:
+            seen.append(item)
+    return seen
+
+
+def html_impersonate_names() -> list[str]:
+    locked = os.environ.get("DOUYIN_HTML_IMPERSONATE", "").strip()
+    if locked:
+        return [locked]
+    # 分享页必须像手机浏览器，否则 iesdouyin 会 302 到 www.douyin.com 验证页
+    return [
+        "safari17_2_ios",
+        "safari18_0_ios",
+        "safari184",
+        "safari18_0",
+        "safari17_0",
+    ]
+
+
+def _html_hint(html: str) -> str:
+    match = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
+    title = re.sub(r"\s+", " ", match.group(1)).strip()[:80] if match else ""
+    flags = [kw for kw in ("captcha", "verify", "login", "验证", "登录") if kw in html]
+    return f"title={title!r} flags={flags}"
+
+
+def _looks_html(text: str) -> bool:
+    head = text.lstrip()[:32].lower()
+    return head.startswith("<!doctype") or head.startswith("<html")
+
+
+def _body_hint(text: str) -> str:
+    compact = re.sub(r"\s+", " ", (text or "").strip())[:80]
+    if _looks_html(text or ""):
+        return _html_hint(text)
+    return f"body_len={len(text or '')} body={compact!r}"
+
+
+def _params_dict(aweme_id: str, profile: BrowserProfile, ms_token: str) -> dict:
+    params = PostDetail(aweme_id=aweme_id)
+    data = params.dict() if hasattr(params, "dict") else params.model_dump()
+    data["msToken"] = ms_token
+    data["browser_version"] = profile.browser_version
+    data["engine_version"] = profile.engine_version
+    data["browser_name"] = profile.browser_name
+    data["engine_name"] = profile.engine_name
+    return data
+
+
+async def fetch_aweme_detail(
+    aweme_id: str,
+    cookie: str,
+    client,
+    has_cffi: bool,
+    profile: BrowserProfile | None = None,
+) -> dict:
+    """请求 aweme/detail。curl_cffi 遇 403 立即换指纹，不再对同一 impersonate 空转重签。"""
+    profile = profile or active_profile(has_cffi)
+    ms_token, ms_source = resolve_ms_token(cookie)
+    if not ms_token:
+        logger.warning("msToken 为空（cookie 无此字段且生成失败），禁止再写死空串之外已无值可填")
+    headers = {
+        "Referer": "https://www.douyin.com/",
+        "Accept": "application/json",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    if not has_cffi:
+        headers["User-Agent"] = profile.ua
+
+    last_status = None
+    last_kind = "empty"
+    for attempt in range(1, WEB_API_ATTEMPTS + 1):
+        params_dict = _params_dict(aweme_id, profile, ms_token)
+        a_bogus = BogusManager.ab_model_2_endpoint(params_dict, profile.ua)
+        endpoint = f"{DouyinAPIEndpoints.POST_DETAIL}?{urlencode(params_dict)}&a_bogus={a_bogus}"
+        logger.info(
+            "Web API 详情 aweme_id=%s impersonate=%s sign_ua=%s msToken_source=%s attempt=%s/%s",
+            aweme_id,
+            profile.impersonate or "httpx",
+            profile.ua,
+            ms_source,
+            attempt,
+            WEB_API_ATTEMPTS,
+        )
+        try:
+            resp = await client.get(endpoint, headers=headers)
+        except Exception as exc:
+            last_kind = "connect"
+            logger.warning("Web API 请求失败 impersonate=%s attempt=%s: %s", profile.impersonate or "httpx", attempt, exc)
+            if attempt == WEB_API_ATTEMPTS:
+                raise WebApiError("connect", "无法连接抖音服务器，请检查 NAS 网络后重试")
+            continue
+
+        last_status = getattr(resp, "status_code", None)
+        text = resp.text or ""
+        if last_status == 403:
+            last_kind = "forbidden"
+            logger.warning(
+                "Web API 403 impersonate=%s attempt=%s %s",
+                profile.impersonate or "httpx",
+                attempt,
+                _body_hint(text),
+            )
+            # 同一 TLS 指纹再签仍是 403；换 impersonate 才有意义
+            if has_cffi:
+                raise WebApiError("forbidden", "抖音风控拦截了最高清晰度接口（HTTP 403）", last_status)
+            continue
+        if last_status != 200:
+            last_kind = "http"
+            logger.warning(
+                "Web API HTTP %s impersonate=%s attempt=%s %s",
+                last_status,
+                profile.impersonate or "httpx",
+                attempt,
+                _body_hint(text),
+            )
+            continue
+        if not text.strip():
+            last_kind = "empty"
+            logger.warning("Web API 空包 impersonate=%s attempt=%s", profile.impersonate or "httpx", attempt)
+            continue
+        if _looks_html(text):
+            last_kind = "forbidden"
+            logger.warning(
+                "Web API 返回验证页 HTML impersonate=%s attempt=%s %s",
+                profile.impersonate or "httpx",
+                attempt,
+                _html_hint(text),
+            )
+            if has_cffi:
+                raise WebApiError("forbidden", "抖音风控拦截了最高清晰度接口（HTTP 403）", last_status)
+            continue
+        try:
+            payload = resp.json()
+        except Exception:
+            last_kind = "empty"
+            logger.warning("Web API 非 JSON impersonate=%s attempt=%s prefix=%r", profile.impersonate or "httpx", attempt, text[:80])
+            continue
+        if not isinstance(payload, dict):
+            last_kind = "empty"
+            continue
+        detail = payload.get("aweme_detail")
+        if not isinstance(detail, dict):
+            last_kind = "empty"
+            logger.warning(
+                "Web API aweme_detail 为空 impersonate=%s attempt=%s keys=%s",
+                profile.impersonate or "httpx",
+                attempt,
+                list(payload.keys())[:8],
+            )
+            continue
+        video = detail.get("video") if isinstance(detail.get("video"), dict) else {}
+        bit_rate = video.get("bit_rate")
+        if not isinstance(bit_rate, list) or not bit_rate:
+            raise WebApiError("no_bit_rate", "详情接口未返回清晰度列表", last_status)
+        logger.info(
+            "Web API 成功 aweme_id=%s impersonate=%s bit_rate档数=%s",
+            aweme_id,
+            profile.impersonate or "httpx",
+            len(bit_rate),
+        )
+        return payload
+
+    if last_kind == "forbidden":
+        raise WebApiError("forbidden", "抖音风控拦截了最高清晰度接口（HTTP 403）", last_status)
+    if last_kind == "connect":
+        raise WebApiError("connect", "无法连接抖音服务器，请检查 NAS 网络后重试", last_status)
+    raise WebApiError(last_kind, "最高清晰度接口未返回作品数据", last_status)
+
 
 class DouyinWebCrawler:
 
@@ -85,29 +384,13 @@ class DouyinWebCrawler:
 
     "-------------------------------------------------------handler接口列表-------------------------------------------------------"
 
-    # 获取单个作品数据
+    # 获取单个作品数据（产品解析请走 parser 传入的 curl_cffi 会话）
     async def fetch_one_video(self, aweme_id: str):
-        # 获取抖音的实时Cookie
         kwargs = await self.get_douyin_headers()
-        # 创建一个基础爬虫
+        cookie = kwargs["headers"].get("Cookie") or ""
         base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
         async with base_crawler as crawler:
-            # 创建一个作品详情的BaseModel参数
-            params = PostDetail(aweme_id=aweme_id)
-            # 生成一个作品详情的带有加密参数的Endpoint
-            # 2024年6月12日22:41:44 由于XBogus加密已经失效，所以不再使用XBogus加密参数，转移至a_bogus加密参数。
-            # endpoint = BogusManager.xb_model_2_endpoint(
-            #     DouyinAPIEndpoints.POST_DETAIL, params.dict(), kwargs["headers"]["User-Agent"]
-            # )
-
-            # 生成一个作品详情的带有a_bogus加密参数的Endpoint
-            params_dict = params.dict()
-            params_dict["msToken"] = ''
-            a_bogus = BogusManager.ab_model_2_endpoint(params_dict, kwargs["headers"]["User-Agent"])
-            endpoint = f"{DouyinAPIEndpoints.POST_DETAIL}?{urlencode(params_dict)}&a_bogus={a_bogus}"
-
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await fetch_aweme_detail(aweme_id, cookie, crawler.aclient, has_cffi=False)
 
     # 获取用户发布作品数据
     async def fetch_user_post_videos(self, sec_user_id: str, max_cursor: int, count: int):

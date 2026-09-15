@@ -44,6 +44,10 @@ class ABogus:
         3817729613,
         2969243214,
     ]
+    USERAGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
+    )
     __str = {
         "s0": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=",
         "s1": "Dkdpgh4ZKsQB80/Mfvw36XI1R25+WUAlEi7NLboqYTOPuzmFjJnryx9HVGcaStCe=",
@@ -53,46 +57,13 @@ class ABogus:
     }
 
     def __init__(self,
-                 # user_agent: str = USERAGENT,
+                 user_agent: str = None,
                  platform: str = None, ):
         self.chunk = []
         self.size = 0
         self.reg = self.__reg[:]
-        # self.ua_code = self.generate_ua_code(user_agent)
-        # Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36
-        self.ua_code = [
-            76,
-            98,
-            15,
-            131,
-            97,
-            245,
-            224,
-            133,
-            122,
-            199,
-            241,
-            166,
-            79,
-            34,
-            90,
-            191,
-            128,
-            126,
-            122,
-            98,
-            66,
-            11,
-            14,
-            40,
-            49,
-            110,
-            110,
-            173,
-            67,
-            96,
-            138,
-            252]
+        # ua_code 必须与实际请求 UA / impersonate 一致；缺省仍用 Chrome 90（与旧 config.yaml 对齐）
+        self.ua_code = self.generate_ua_code(user_agent or self.USERAGENT)
         self.browser = self.generate_browser_info(
             platform) if platform else self.__browser
         self.browser_len = len(self.browser)
@@ -191,6 +162,11 @@ class ABogus:
         a.extend(self.browser_code)
         a.append(e)
         return self.rc4_encrypt(self.from_char_code(*a), "y")
+
+    def generate_ua_code(self, user_agent: str) -> list[int]:
+        u = self.rc4_encrypt(user_agent, self.__ua_key)
+        u = self.generate_result(u, "s3")
+        return self.sum(u)
 
     def generate_string_2_list(
             self,

@@ -28,7 +28,7 @@
 
 - 访问密码登录（session 约 7 天，失败限流）
 - 粘贴抖音分享文案 / 链接，一次最多 30 条，流式出结果；失败条目可单独重试
-- 视频：最高码率无水印，服务端代理下载（避免手机直链 403 / CORS）
+- 视频：优先 Web API `bit_rate` 最高分辨率档（不是分享页把 `ratio=` 调大）。Docker 若详情接口被拦，会回落到页面档并在卡片上标明「非最高清晰度」
 - 图文：解析全部无水印原图，逐张代理下载，也可一键按序下载全部
 - 封面 / 图片均走本站代理，不把抖音直链暴露给浏览器
 - 文件名：`作者-文案前10字-日期(yy-mm-dd).mp4`（图文带 `-01.webp` 等序号）
@@ -57,7 +57,7 @@ docker compose up -d --build
 
 浏览器打开 `http://127.0.0.1:18080/`（容器内 8080，默认映射到主机 18080）。
 
-健康检查：`GET /healthz` 中 `parser` 应为 `embedded-crawler`，`cookie_length` 应大于 0。
+健康检查：`GET /healthz` 中 `parser` 应为 `embedded`，`parse_mode` 为 `web-api+html-fallback`，`http_client` 在容器内应为 `curl_cffi`，`cookie_length` 应大于 0。
 
 ## 如何获取 Cookie
 

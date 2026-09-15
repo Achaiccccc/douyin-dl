@@ -1,7 +1,8 @@
 """抖音分享链接最小解析器（支持批量）。
 
-策略：分享页 / 详情页 HTML 内嵌 JSON（window._ROUTER_DATA、<script id="RENDER_DATA">），
-该路径不需要 a_bogus / X-Bogus 签名，只需有效 Cookie，符合最小依赖原则。
+主路径：硬化后的 Web API `aweme/detail`（curl_cffi + 真 msToken + UA/签名对齐），
+从 `video.bit_rate` 按分辨率优先选出最高档。
+备路径：分享页 / 详情页 HTML，只保证能解析，标记为非最高档。
 """
 from __future__ import annotations
 
@@ -62,6 +63,11 @@ RISK_OR_COOKIE_HINT = (
     "抖音未返回作品数据（请求较频繁触发风控，或 Cookie 失效）。"
     "请稍后点「重试」；若多次重试仍失败，" + COOKIE_HINT
 )
+WEBAPI_403_HINT = (
+    "抖音风控拦截了最高清晰度接口（HTTP 403），页面档也未能解析。"
+    "请稍后重试；若多次失败请更新 cookie.txt 后重启容器"
+)
+HTML_ONLY_HINT = "未能取到最高清晰度，当前为页面档（样本约 2MB）"
 
 
 class ParseError(Exception):
@@ -84,6 +90,22 @@ class ParsedVideo:
     source_url: str = ""
     kind: str = "video"  # video | image
     image_urls: list[str] | None = None
+    quality_source: str = ""  # web-api | html | upstream
+    width: int = 0
+    height: int = 0
+    gear_name: str = ""
+    data_size: int | None = None
+    bit_rate: int | None = None
+
+
+@dataclass
+class PlayPick:
+    url: str
+    gear_name: str = ""
+    width: int = 0
+    height: int = 0
+    bit_rate: int = 0
+    data_size: int | None = None
 
 
 @dataclass
@@ -140,16 +162,22 @@ def _aweme_id_from(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _headers(ua: str, cookie: str) -> dict[str, str]:
+def _headers(
+    ua: str,
+    cookie: str,
+    *,
+    referer: str = "https://www.douyin.com/",
+    with_cookie: bool = True,
+) -> dict[str, str]:
     headers = {
-        "Referer": "https://www.douyin.com/",
+        "Referer": referer,
         "Accept-Language": "zh-CN,zh;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     # curl_cffi impersonate 会带匹配的 UA；再覆盖会破坏 TLS/JA3 一致性
     if not _HAS_CFFI:
         headers["User-Agent"] = ua
-    if cookie:
+    if with_cookie and cookie:
         headers["Cookie"] = cookie
     return headers
 
@@ -162,33 +190,85 @@ def _page_hint(html: str) -> str:
     return f"title={title!r} flags={flags}"
 
 
-def _make_http_client(timeout: float):
+def _make_http_client(timeout: float, impersonate: str | None = None):
     """优先 curl_cffi 模拟浏览器 TLS（Linux 容器必须）；本机可回落到 httpx。"""
     if _HAS_CFFI:
-        kwargs = {
-            "impersonate": "chrome131",
-            "timeout": timeout,
-            "allow_redirects": True,
-            "max_clients": 8,
-        }
-        try:
-            from curl_cffi import CurlOpt
+        from crawlers.douyin.web.web_crawler import active_profile
 
-            kwargs["curl_options"] = {CurlOpt.IPRESOLVE: 1}  # 强制 IPv4，避开 NAS IPv6 风控节点
-        except Exception:
-            pass
-        try:
-            return CffiAsyncSession(**kwargs)
-        except TypeError:
-            kwargs.pop("curl_options", None)
-            kwargs.pop("max_clients", None)
-            return CffiAsyncSession(**kwargs)
+        names: list[str] = []
+        if impersonate:
+            names.append(impersonate)
+        else:
+            profile = active_profile(True)
+            names.append(profile.impersonate or "chrome131")
+        seen: list[str] = []
+        for name in names:
+            if name and name not in seen:
+                seen.append(name)
+        last_error: Exception | None = None
+        for name in seen:
+            kwargs = {
+                "impersonate": name,
+                "timeout": timeout,
+                "allow_redirects": True,
+                "max_clients": 8,
+            }
+            try:
+                from curl_cffi import CurlOpt
+
+                kwargs["curl_options"] = {CurlOpt.IPRESOLVE: 1}
+            except Exception:
+                pass
+            try:
+                session = CffiAsyncSession(**kwargs)
+                logger.info("curl_cffi 会话 impersonate=%s", name)
+                return session
+            except TypeError:
+                kwargs.pop("curl_options", None)
+                kwargs.pop("max_clients", None)
+                try:
+                    session = CffiAsyncSession(**kwargs)
+                    logger.info("curl_cffi 会话 impersonate=%s", name)
+                    return session
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("impersonate=%s 不可用: %s", name, exc)
+            except Exception as exc:
+                last_error = exc
+                logger.warning("impersonate=%s 不可用: %s", name, exc)
+        raise RuntimeError(f"无法创建 curl_cffi 会话: {last_error}")
     transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
     return httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(timeout),
         transport=transport,
     )
+
+
+def _make_html_client(timeout: float):
+    if not _HAS_CFFI:
+        return _make_http_client(timeout)
+    from crawlers.douyin.web.web_crawler import html_impersonate_names
+
+    last_error: Exception | None = None
+    for name in html_impersonate_names():
+        try:
+            return _make_http_client(timeout, impersonate=name)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("HTML impersonate=%s 失败: %s", name, exc)
+    if last_error:
+        logger.warning("HTML 移动端 impersonate 全部失败，回落 chrome131: %s", last_error)
+    return _make_http_client(timeout, impersonate="chrome131")
+
+
+async def _close_http_client(client) -> None:
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if not close:
+        return
+    result = close()
+    if asyncio.iscoroutine(result):
+        await result
 
 
 def _first_url(node) -> str | None:
@@ -224,32 +304,79 @@ def _bump_ratio(url: str) -> str:
     return f"{url}{sep}ratio=1080p"
 
 
-def _pick_play_url(video: dict) -> str | None:
-    # 优先：bit_rate 列表里码率最高的一档
-    best_url, best_br = None, -1
+def _int_or_zero(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _entry_dims(entry: dict, play_addr: dict | None) -> tuple[int, int]:
+    addr = play_addr if isinstance(play_addr, dict) else {}
+    width = _int_or_zero(entry.get("width") or addr.get("width"))
+    height = _int_or_zero(entry.get("height") or addr.get("height"))
+    return width, height
+
+
+def _pick_bit_rate(video: dict) -> PlayPick | None:
+    """有 bit_rate 时：分辨率优先，码率其次，体积再次。不对选出的 URL 调 ratio。"""
     bit_rates = video.get("bit_rate") or video.get("bitRate")
-    if isinstance(bit_rates, list):
-        for entry in bit_rates:
-            if not isinstance(entry, dict):
-                continue
-            url = _first_url(entry.get("play_addr")) or _first_url(entry.get("playAddr"))
-            br = entry.get("bit_rate") or entry.get("bitRate") or 0
-            if url and br > best_br:
-                best_url, best_br = url, br
-    if best_url:
-        logger.info("选用码率档位: %s bps", best_br)
-        return best_url.replace("playwm", "play")
-    # 兜底：play_addr 并提升 ratio
+    if not isinstance(bit_rates, list):
+        return None
+    best: PlayPick | None = None
+    best_key = None
+    for entry in bit_rates:
+        if not isinstance(entry, dict):
+            continue
+        play_addr = entry.get("play_addr") or entry.get("playAddr")
+        url = _first_url(play_addr)
+        if not url:
+            continue
+        width, height = _entry_dims(entry, play_addr if isinstance(play_addr, dict) else None)
+        bps = _int_or_zero(entry.get("bit_rate") or entry.get("bitRate"))
+        size_raw = entry.get("data_size") or entry.get("dataSize")
+        if size_raw in (None, "") and isinstance(play_addr, dict):
+            size_raw = play_addr.get("data_size") or play_addr.get("dataSize")
+        size = _int_or_zero(size_raw) if size_raw not in (None, "") else None
+        key = (width * height, bps, size or 0)
+        if best_key is None or key > best_key:
+            best_key = key
+            best = PlayPick(
+                url=url.replace("playwm", "play"),
+                gear_name=str(entry.get("gear_name") or entry.get("gearName") or ""),
+                width=width,
+                height=height,
+                bit_rate=bps,
+                data_size=size,
+            )
+    return best
+
+
+def _html_play_url(video: dict) -> PlayPick | None:
+    """HTML 兜底：只用页面 play_addr，允许 bump ratio，明确不是 4K。"""
     url = None
     play_addr = video.get("play_addr")
+    width = height = 0
     if isinstance(play_addr, dict):
         url = _first_url(play_addr.get("url_list"))
+        width = _int_or_zero(play_addr.get("width"))
+        height = _int_or_zero(play_addr.get("height"))
     if not url:
-        # 网页版 RENDER_DATA 的 camelCase 结构
         url = _first_url(video.get("playAddr")) or _first_url(video.get("playApi"))
-    if url:
-        return _bump_ratio(url.replace("playwm", "play"))
-    return None
+    if not url:
+        return None
+    return PlayPick(
+        url=_bump_ratio(url.replace("playwm", "play")),
+        gear_name="html_play_addr",
+        width=width,
+        height=height,
+    )
+
+
+def _pick_play_url(video: dict) -> str | None:
+    # 兼容旧调用（RENDER_DATA 递归查找）：有码率列表则取最高分辨率档，否则 bump 页面地址
+    picked = _pick_bit_rate(video) or _html_play_url(video)
+    return picked.url if picked else None
 
 
 def _pick_author(item: dict) -> str:
@@ -312,21 +439,61 @@ def _pick_images(node: dict) -> list[str]:
     return urls
 
 
-def _build_parsed(detail: dict, aweme_id: str, source_url: str) -> ParsedVideo:
+def _apply_quality(video: ParsedVideo, pick: PlayPick | None, quality_source: str) -> ParsedVideo:
+    video.quality_source = quality_source
+    if pick:
+        video.video_url = pick.url
+        video.width = pick.width
+        video.height = pick.height
+        video.gear_name = pick.gear_name
+        video.data_size = pick.data_size
+        video.bit_rate = pick.bit_rate or None
+        extra = ""
+        if pick.data_size:
+            extra = f" data_size={pick.data_size}"
+        logger.info(
+            "gear_name=%s %sx%s bps=%s%s quality_source=%s",
+            pick.gear_name or "-",
+            pick.width,
+            pick.height,
+            pick.bit_rate,
+            extra,
+            quality_source,
+        )
+    return video
+
+
+def _build_parsed(
+    detail: dict,
+    aweme_id: str,
+    source_url: str,
+    quality_source: str = "web-api",
+    play: PlayPick | None = None,
+) -> ParsedVideo:
     images = _pick_images(detail)
     aweme_type = detail.get("aweme_type")
-    play = _pick_play_url(detail.get("video") or {})
-    if not play:
-        uri = ((detail.get("video") or {}).get("play_addr") or {}).get("uri")
-        if uri:
-            play = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0"
+    video_node = detail.get("video") or {}
+    if play is None:
+        if quality_source == "html":
+            play = _html_play_url(video_node)
+        else:
+            play = _pick_bit_rate(video_node) or _html_play_url(video_node)
+        if play is None:
+            uri = (video_node.get("play_addr") or {}).get("uri") if isinstance(video_node.get("play_addr"), dict) else None
+            if uri:
+                raw = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0"
+                if quality_source == "html":
+                    play = PlayPick(url=_bump_ratio(raw), gear_name="html_uri")
+                else:
+                    play = PlayPick(url=raw)
+    play_url = play.url if play else ""
     is_image = bool(images) and (
-        aweme_type in IMAGE_AWEME_TYPES or aweme_type is None or not play
+        aweme_type in IMAGE_AWEME_TYPES or aweme_type is None or not play_url
     )
     if is_image:
         cover = (
             images[0]
-            or _first_url((detail.get("video") or {}).get("cover"))
+            or _first_url(video_node.get("cover"))
             or ""
         )
         video = ParsedVideo(
@@ -339,26 +506,28 @@ def _build_parsed(detail: dict, aweme_id: str, source_url: str) -> ParsedVideo:
             source_url=source_url,
             kind="image",
             image_urls=images,
+            quality_source=quality_source,
         )
         _put_cache(video)
         return video
-    if not play:
+    if not play_url:
         raise ParseError("该作品未找到无水印视频或图片")
     cover = (
-        _first_url((detail.get("video") or {}).get("cover"))
-        or _first_url((detail.get("video") or {}).get("origin_cover"))
+        _first_url(video_node.get("cover"))
+        or _first_url(video_node.get("origin_cover"))
         or ""
     )
     video = ParsedVideo(
         aweme_id=str(detail.get("aweme_id") or aweme_id),
         title=(detail.get("desc") or "").strip() or f"抖音视频_{aweme_id}",
         cover=cover,
-        video_url=play,
+        video_url=play_url,
         author=_pick_author(detail),
         date=_pick_date(detail),
         source_url=source_url,
         kind="video",
     )
+    _apply_quality(video, play, quality_source)
     _put_cache(video)
     return video
 
@@ -378,7 +547,7 @@ def _from_router_data(html: str, aweme_id: str) -> ParsedVideo | None:
         info = page.get("videoInfoRes") or {}
         items = info.get("item_list") or []
         if items:
-            return _build_parsed(items[0], aweme_id, "")
+            return _build_parsed(items[0], aweme_id, "", quality_source="html")
     return None
 
 
@@ -411,7 +580,7 @@ def _from_render_data(html: str, aweme_id: str) -> ParsedVideo | None:
     item = _find_aweme(data)
     if not item:
         return None
-    return _build_parsed(item, aweme_id, "")
+    return _build_parsed(item, aweme_id, "", quality_source="html")
 
 
 async def _resolve_aweme_id(client, url: str, cookie: str) -> str:
@@ -437,7 +606,12 @@ async def _fetch_detail_once(client, aweme_id: str, cookie: str) -> tuple[Parsed
     try:
         resp = await client.get(
             f"https://www.iesdouyin.com/share/video/{aweme_id}",
-            headers=_headers(MOBILE_UA, cookie),
+            headers=_headers(
+                MOBILE_UA,
+                cookie,
+                referer="https://www.iesdouyin.com/",
+                with_cookie=False,
+            ),
         )
         page_ok = True
         video = _from_router_data(resp.text, aweme_id)
@@ -544,9 +718,10 @@ def _from_hybrid(payload: dict, source_url: str) -> ParsedVideo:
         merged["video"] = {"cover": cover_data.get("cover"), "play_addr": {"url_list": [play] if play else []}}
     elif play:
         merged.setdefault("video", {})
-    video = _build_parsed(merged, aweme_id, source_url)
+    video = _build_parsed(merged, aweme_id, source_url, quality_source="upstream")
     if play and video.kind == "video":
         video.video_url = play
+        video.quality_source = "upstream"
     return video
 
 
@@ -576,6 +751,112 @@ async def _parse_via_upstream(client: httpx.AsyncClient, url: str) -> ParsedVide
     return _from_hybrid(payload, url)
 
 
+async def _parse_via_web_api(url: str, cookie: str, aweme_id: str) -> ParsedVideo:
+    from crawlers.douyin.web.web_crawler import (
+        WebApiError,
+        api_profile_chain,
+        fetch_aweme_detail,
+        impersonate_names,
+    )
+
+    last_error: Exception | None = None
+    chain = api_profile_chain(_HAS_CFFI)
+    for index, profile in enumerate(chain):
+        names = impersonate_names(profile) if _HAS_CFFI else [None]
+        opened = False
+        for name in names:
+            client = None
+            try:
+                client = _make_http_client(config.HTTP_TIMEOUT, impersonate=name)
+            except Exception as exc:
+                logger.warning("无法创建 Web API 会话 impersonate=%s: %s", name or profile.impersonate, exc)
+                last_error = exc
+                continue
+            opened = True
+            try:
+                raw = await fetch_aweme_detail(
+                    aweme_id, cookie, client, has_cffi=_HAS_CFFI, profile=profile
+                )
+            except WebApiError as exc:
+                last_error = exc
+                logger.warning(
+                    "Web API 指纹失败 impersonate=%s kind=%s status=%s",
+                    profile.impersonate or "httpx",
+                    exc.kind,
+                    exc.status,
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Web API 请求异常 impersonate=%s: %s", profile.impersonate or "httpx", exc)
+            else:
+                detail = raw.get("aweme_detail") if isinstance(raw, dict) else None
+                if not isinstance(detail, dict):
+                    last_error = WebApiError("empty", "最高清晰度接口未返回作品数据")
+                else:
+                    pick = _pick_bit_rate(detail.get("video") or {})
+                    return _build_parsed(detail, aweme_id, url, quality_source="web-api", play=pick)
+            finally:
+                if client is not None:
+                    await _close_http_client(client)
+            break
+        if not opened:
+            continue
+        if index < len(chain) - 1:
+            await asyncio.sleep(0.4)
+    logger.warning("Web API 已试完 impersonate 链仍失败，停止盲试")
+    if isinstance(last_error, WebApiError):
+        raise last_error
+    if last_error:
+        raise WebApiError("http", str(last_error))
+    raise WebApiError("forbidden", "抖音风控拦截了最高清晰度接口（HTTP 403）")
+
+
+async def _parse_via_html(client, url: str, cookie: str, aweme_id: str) -> ParsedVideo:
+    video = await _fetch_detail(client, aweme_id, cookie)
+    video.source_url = url
+    if video.kind == "video":
+        video.quality_source = video.quality_source or "html"
+    _put_cache(video)
+    return video
+
+
+async def _parse_layered(client, url: str, cookie: str) -> ParsedVideo:
+    from crawlers.douyin.web.web_crawler import WebApiError
+
+    aweme_id = await _resolve_aweme_id(client, url, cookie)
+    cached = get_cached(aweme_id)
+    if cached:
+        cached.source_url = url
+        return cached
+    web_err: WebApiError | None = None
+    try:
+        return await _parse_via_web_api(url, cookie, aweme_id)
+    except WebApiError as exc:
+        web_err = exc
+        logger.warning(
+            "Web API 主路径失败 kind=%s status=%s: %s，进入 HTML 兜底",
+            exc.kind,
+            exc.status,
+            exc,
+        )
+    except Exception as exc:
+        logger.warning("Web API 主路径异常: %s，进入 HTML 兜底", exc)
+        web_err = WebApiError("http", str(exc))
+    try:
+        video = await _parse_via_html(client, url, cookie, aweme_id)
+        if video.kind == "video":
+            logger.info("HTML 兜底成功 aweme_id=%s quality_source=html（非本里程碑验收档）", aweme_id)
+        return video
+    except ParseError as html_exc:
+        if "未配置 Cookie" in str(html_exc):
+            raise html_exc
+        if web_err and web_err.kind == "forbidden":
+            raise ParseError(WEBAPI_403_HINT, 502)
+        if web_err and web_err.kind == "connect" and "无法连接" in str(html_exc):
+            raise ParseError("无法连接抖音服务器，请检查 NAS 网络后重试", 502)
+        raise html_exc
+
+
 _crawler = None
 
 
@@ -589,6 +870,29 @@ def _inject_cookie(cookie: str) -> None:
     web_utils.config["TokenManager"]["douyin"]["headers"]["Cookie"] = cookie
 
 
+def parse_health() -> dict:
+    from crawlers.douyin.web.web_crawler import api_profile_chain, cookie_value, html_impersonate_names
+
+    cookie = config.load_cookie()
+    chain = api_profile_chain(_HAS_CFFI)
+    if config.UPSTREAM_API:
+        parse_mode = "upstream"
+        parser_name = "upstream"
+    else:
+        parse_mode = "web-api+html-fallback"
+        parser_name = "embedded"
+    return {
+        "parser": parser_name,
+        "parse_mode": parse_mode,
+        "http_client": "curl_cffi" if _HAS_CFFI else "httpx",
+        "impersonate": chain[0].impersonate or "",
+        "impersonate_chain": ",".join(p.impersonate or "httpx" for p in chain),
+        "html_impersonate": ",".join(html_impersonate_names()) if _HAS_CFFI else "",
+        "cookie_has_sessionid": bool(cookie_value(cookie, "sessionid")),
+        "cookie_has_mstoken": bool(cookie_value(cookie, "msToken")),
+    }
+
+
 def _get_crawler():
     global _crawler
     if _crawler is None:
@@ -599,43 +903,20 @@ def _get_crawler():
     return _crawler
 
 
-async def _parse_via_crawler(url: str) -> ParsedVideo:
-    crawler = _get_crawler()
-    try:
-        aweme_id = str(await crawler.get_aweme_id(url))
-    except Exception as exc:
-        logger.warning("短链解析失败 %s: %s", url, exc)
-        raise ParseError("无法从链接中获取作品 ID", 502)
-    cached = get_cached(aweme_id)
-    if cached:
-        cached.source_url = url
-        return cached
-    try:
-        raw = await crawler.fetch_one_video(aweme_id)
-    except Exception as exc:
-        logger.warning("内嵌 crawler 请求失败 %s: %s", url, exc)
-        raise ParseError("解析服务请求失败，请稍后重试", 502)
-    detail = raw.get("aweme_detail") if isinstance(raw, dict) else None
-    if not isinstance(detail, dict):
-        logger.warning("crawler 未返回 aweme_detail: %s", str(raw)[:400])
-        if not config.load_cookie():
-            raise ParseError("未配置 Cookie：请在 data/cookie.txt 放入后重启容器", 502)
-        raise ParseError(COOKIE_HINT, 502)
-    return _build_parsed(detail, aweme_id, url)
-
-
 async def iter_parse_urls(urls: list[str]):
     """逐条产出 (index, ParseItem)，完成一条 yield 一条。"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
     queue: asyncio.Queue[tuple[int, ParseItem]] = asyncio.Queue()
     use_upstream = bool(config.UPSTREAM_API)
+    cookie = config.load_cookie()
+    client = None if use_upstream else _make_html_client(config.HTTP_TIMEOUT)
 
     async def run_one(url: str) -> ParsedVideo:
         if use_upstream:
             timeout = httpx.Timeout(config.UPSTREAM_TIMEOUT)
-            async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-                return await _parse_via_upstream(client, url)
-        return await _parse_via_crawler(url)
+            async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as upstream:
+                return await _parse_via_upstream(upstream, url)
+        return await _parse_layered(client, url, cookie)
 
     async def worker(index: int, url: str) -> None:
         async with semaphore:
@@ -650,8 +931,16 @@ async def iter_parse_urls(urls: list[str]):
     if use_upstream:
         logger.info("解析走 HTTP 上游: %s", config.UPSTREAM_API)
     else:
-        logger.info("解析走内嵌 DouyinWebCrawler（evil0ctal 签名逻辑）")
-        _get_crawler()
+        from crawlers.douyin.web.web_crawler import api_profile_chain, html_impersonate_names
+
+        chain = api_profile_chain(_HAS_CFFI)
+        logger.info(
+            "解析走 Web API 主路径 + HTML 兜底 http_client=%s impersonate_chain=%s html_impersonate=%s",
+            "curl_cffi" if _HAS_CFFI else "httpx",
+            ",".join(p.impersonate or "httpx" for p in chain),
+            ",".join(html_impersonate_names()) if _HAS_CFFI else "httpx",
+        )
+        _inject_cookie(cookie)
 
     tasks = [asyncio.create_task(worker(i, u)) for i, u in enumerate(urls)]
     try:
@@ -659,6 +948,8 @@ async def iter_parse_urls(urls: list[str]):
             yield await queue.get()
     finally:
         await asyncio.gather(*tasks, return_exceptions=True)
+        if client is not None:
+            await _close_http_client(client)
 
 
 async def parse_urls(urls: list[str]) -> list[ParseItem]:

@@ -17,17 +17,25 @@ from pydantic import BaseModel
 from . import auth, config, parser
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("douyin-dl.main")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     cookie = config.load_cookie()
+    health = parser.parse_health()
     logger.info(
-        "启动: COOKIE_FILE=%s cookie长度=%d parser=%s",
+        "启动: COOKIE_FILE=%s cookie长度=%d parser=%s parse_mode=%s http_client=%s impersonate_chain=%s html_impersonate=%s sessionid=%s msToken=%s",
         config.COOKIE_FILE,
         len(cookie),
-        f"upstream:{config.UPSTREAM_API}" if config.UPSTREAM_API else "embedded-crawler",
+        health["parser"],
+        health["parse_mode"],
+        health["http_client"],
+        health.get("impersonate_chain") or health.get("impersonate") or "httpx",
+        health.get("html_impersonate") or "",
+        "yes" if health["cookie_has_sessionid"] else "no",
+        "yes" if health["cookie_has_mstoken"] else "no",
     )
     if not cookie and not config.UPSTREAM_API:
         logger.warning("未读到 Cookie，内嵌解析将不可用")
@@ -61,14 +69,21 @@ async def healthz() -> dict:
     cookie = config.load_cookie()
     path = config.COOKIE_FILE
     exists = path.exists()
+    health = parser.parse_health()
     return {
         "ok": True,
         "upstream": config.UPSTREAM_API or "",
-        "parser": "upstream" if config.UPSTREAM_API else "embedded-crawler",
-        "http_client": "curl_cffi" if parser._HAS_CFFI else "httpx",
+        "parser": health["parser"],
+        "parse_mode": health["parse_mode"],
+        "http_client": health["http_client"],
+        "impersonate": health["impersonate"],
+        "impersonate_chain": health.get("impersonate_chain") or health["impersonate"],
+        "html_impersonate": health.get("html_impersonate") or "",
         "cookie_length": len(cookie),
         "cookie_file_exists": exists,
         "cookie_is_file": path.is_file() if exists else False,
+        "cookie_has_sessionid": health["cookie_has_sessionid"],
+        "cookie_has_mstoken": health["cookie_has_mstoken"],
     }
 
 
@@ -95,6 +110,16 @@ def _item_to_json(item: parser.ParseItem) -> dict:
         ]
     else:
         payload["download_url"] = f"/api/download?id={video.aweme_id}"
+        payload["quality_source"] = video.quality_source
+        if video.width and video.height:
+            payload["width"] = video.width
+            payload["height"] = video.height
+        if video.gear_name:
+            payload["gear_name"] = video.gear_name
+        if video.data_size:
+            payload["data_size"] = video.data_size
+        if video.quality_source == "html":
+            payload["quality_warning"] = parser.HTML_ONLY_HINT
     return payload
 
 

@@ -13,6 +13,7 @@
     loginError: document.getElementById("login-error"),
     shareText: document.getElementById("share-text"),
     btnParse: document.getElementById("btn-parse"),
+    btnClear: document.getElementById("btn-clear"),
     parseError: document.getElementById("parse-error"),
     resultSummary: document.getElementById("result-summary"),
     resultList: document.getElementById("result-list"),
@@ -132,6 +133,7 @@
   function finishParse() {
     parsing = false;
     els.btnAgain.disabled = false;
+    if (els.btnClear) els.btnClear.disabled = false;
     setLoading(els.btnParse, false);
     renderSummary();
   }
@@ -184,6 +186,13 @@
     return pump();
   }
 
+  function clearShareText() {
+    if (parsing) return;
+    els.shareText.value = "";
+    hideError(els.parseError);
+    els.shareText.focus();
+  }
+
   function doParse() {
     var text = els.shareText.value.trim();
     if (!text) {
@@ -198,6 +207,7 @@
     els.resultList.innerHTML = "";
     els.resultSummary.textContent = "正在识别链接…";
     els.btnAgain.disabled = true;
+    if (els.btnClear) els.btnClear.disabled = true;
     show("result");
 
     fetch("/api/parse", {
@@ -305,8 +315,20 @@
           " 张";
       } else {
         meta.textContent = (item.author || "未知作者") + (item.date ? " · " + item.date : "");
+        if (item.width && item.height) {
+          meta.textContent += " · " + item.width + "×" + item.height;
+        }
+        if (item.data_size) {
+          meta.textContent += " · 约 " + formatSize(item.data_size);
+        }
       }
       body.appendChild(meta);
+      if (item.quality_warning) {
+        var warn = document.createElement("p");
+        warn.className = "item-quality-warn";
+        warn.textContent = item.quality_warning;
+        body.appendChild(warn);
+      }
 
       if (isImage && item.images && item.images.length) {
         var grid = document.createElement("div");
@@ -372,6 +394,13 @@
       card.appendChild(failBody);
     }
     return card;
+  }
+
+  function formatSize(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1024 / 1024).toFixed(1) + " MB";
   }
 
   function filenameFromDisposition(header, fallback) {
@@ -459,6 +488,9 @@
     if (e.key === "Enter") doLogin();
   });
   els.btnParse.addEventListener("click", doParse);
+  if (els.btnClear) {
+    els.btnClear.addEventListener("click", clearShareText);
+  }
   els.btnAgain.addEventListener("click", function () {
     if (parsing) return;
     els.shareText.value = "";
