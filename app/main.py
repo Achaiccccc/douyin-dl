@@ -26,16 +26,17 @@ async def lifespan(_: FastAPI):
     cookie = config.load_cookie()
     health = parser.parse_health()
     logger.info(
-        "启动: COOKIE_FILE=%s cookie长度=%d parser=%s parse_mode=%s http_client=%s impersonate_chain=%s html_impersonate=%s sessionid=%s msToken=%s",
+        "启动: COOKIE_FILE=%s cookie长度=%d parser=%s parse_mode=%s web_api_client=%s html_client=%s html_impersonate=%s sessionid=%s msToken=%s uifid=%s",
         config.COOKIE_FILE,
         len(cookie),
         health["parser"],
         health["parse_mode"],
+        health.get("web_api_client") or "httpx",
         health["http_client"],
-        health.get("impersonate_chain") or health.get("impersonate") or "httpx",
         health.get("html_impersonate") or "",
         "yes" if health["cookie_has_sessionid"] else "no",
         "yes" if health["cookie_has_mstoken"] else "no",
+        "yes" if health.get("cookie_has_uifid") else "no",
     )
     if not cookie and not config.UPSTREAM_API:
         logger.warning("未读到 Cookie，内嵌解析将不可用")
@@ -76,6 +77,7 @@ async def healthz() -> dict:
         "parser": health["parser"],
         "parse_mode": health["parse_mode"],
         "http_client": health["http_client"],
+        "web_api_client": health.get("web_api_client") or "httpx",
         "impersonate": health["impersonate"],
         "impersonate_chain": health.get("impersonate_chain") or health["impersonate"],
         "html_impersonate": health.get("html_impersonate") or "",
@@ -84,6 +86,8 @@ async def healthz() -> dict:
         "cookie_is_file": path.is_file() if exists else False,
         "cookie_has_sessionid": health["cookie_has_sessionid"],
         "cookie_has_mstoken": health["cookie_has_mstoken"],
+        "cookie_has_uifid": health.get("cookie_has_uifid", False),
+        "cookie_has_secsdk_key": health.get("cookie_has_secsdk_key", False),
     }
 
 

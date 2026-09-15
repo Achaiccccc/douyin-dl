@@ -22,13 +22,13 @@
 | 访问控制 | 视部署而定 | 访问密码 + session |
 | 目标环境 | 通用自建 / 公网 API | 个人 / 家庭 NAS（也可本机或任意 Docker 主机） |
 
-解析签名逻辑（`a_bogus` 等）来自原项目，**没有重新发明反爬**；页面、鉴权、批量解析、图文下载是本项目新增的。
+解析签名逻辑（`a_bogus`、secsdk webSign 等）用于打通 Web API 最高档；页面、鉴权、批量解析、图文下载是本项目新增的。
 
 ## 功能
 
 - 访问密码登录（session 约 7 天，失败限流）
 - 粘贴抖音分享文案 / 链接，一次最多 30 条，流式出结果；失败条目可单独重试
-- 视频：优先 Web API `bit_rate` 最高分辨率档（不是分享页把 `ratio=` 调大）。Docker 若详情接口被拦，会回落到页面档并在卡片上标明「非最高清晰度」
+- 视频：优先 Web API `aweme/detail` 的 `bit_rate` 最高分辨率档（不是分享页把 `ratio=` 调大）。容器里还要 secsdk `x-secsdk-web-signature`；若详情接口被拦，会回落到页面档并在卡片上标明「非最高清晰度」
 - 图文：解析全部无水印原图，逐张代理下载，也可一键按序下载全部
 - 封面 / 图片均走本站代理，不把抖音直链暴露给浏览器
 - 文件名：`作者-文案前10字-日期(yy-mm-dd).mp4`（图文带 `-01.webp` 等序号）
@@ -57,7 +57,7 @@ docker compose up -d --build
 
 浏览器打开 `http://127.0.0.1:18080/`（容器内 8080，默认映射到主机 18080）。
 
-健康检查：`GET /healthz` 中 `parser` 应为 `embedded`，`parse_mode` 为 `web-api+html-fallback`，`http_client` 在容器内应为 `curl_cffi`，`cookie_length` 应大于 0。
+健康检查：`GET /healthz` 中 `parser` 应为 `embedded`，`parse_mode` 为 `web-api+html-fallback`，`web_api_client` 应为 `httpx`，容器内 `http_client`（HTML 兜底）应为 `curl_cffi`，`cookie_length` 应大于 0，且 `cookie_has_sessionid` / `cookie_has_mstoken` / `cookie_has_uifid` 为真。
 
 ## 如何获取 Cookie
 

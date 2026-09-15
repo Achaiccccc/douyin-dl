@@ -34,6 +34,7 @@
 
 
 import asyncio  # 异步I/O
+import hashlib
 import logging
 import os  # 系统操作
 import re
@@ -176,15 +177,9 @@ def active_profile(has_cffi: bool) -> BrowserProfile:
 
 
 def api_profile_chain(has_cffi: bool) -> list[BrowserProfile]:
-    """容器内按设计试 3 档；环境变量锁死后只打那一档。"""
-    if not has_cffi:
-        return [CHROME90]
-    locked = os.environ.get("DOUYIN_IMPERSONATE", "").strip().lower()
-    if locked:
-        if locked in PROFILES:
-            return [PROFILES[locked]]
-        logger.warning("未知 DOUYIN_IMPERSONATE=%s，改走默认链", locked)
-    return [CHROME131, CHROME124, SAFARI184]
+    """Web API 固定 httpx + Chrome 90。容器里 curl_cffi Chrome TLS 会触发 Argus Signature。"""
+    del has_cffi
+    return [CHROME90]
 
 
 def impersonate_names(profile: BrowserProfile) -> list[str]:
@@ -232,7 +227,57 @@ def _body_hint(text: str) -> str:
     return f"body_len={len(text or '')} body={compact!r}"
 
 
-def _params_dict(aweme_id: str, profile: BrowserProfile, ms_token: str) -> dict:
+def resolve_uifid(cookie: str) -> tuple[str, str]:
+    token = cookie_value(cookie, "UIFID")
+    if token:
+        return token, "cookie"
+    token = cookie_value(cookie, "UIFID_TEMP")
+    if token:
+        return token, "cookie_temp"
+    return "", "missing"
+
+
+# secsdk webSign 固定盐。Argus「Signature Not Found」查的是这个 MD5，不是 a_bogus。
+WEB_SIGN_SALT = "A96D855A08C0A9707F8BEF0D9A527E4E"
+
+
+def apply_secsdk_web_sign(url: str, uifid: str, now: int | None = None) -> tuple[str, dict[str, str]]:
+    """给 aweme/detail URL 补 timestamp + x-secsdk-web-signature。
+
+    浏览器 secsdk 的算法是：
+    MD5(f"{uifid}_{timestamp}_{salt}_{query_with_uifid_and_timestamp}")
+    查询里已有 uifid 则不再重复；timestamp / signature 永远挂在末尾。
+    """
+    if not uifid or not url:
+        return url, {}
+    ts = str(int(now if now is not None else time.time()))
+    if "?" in url:
+        head, query = url.split("?", 1)
+    else:
+        head, query = url, ""
+    parts = []
+    for item in query.split("&"):
+        if not item:
+            continue
+        key = item.split("=", 1)[0]
+        if key in {"timestamp", "x-secsdk-web-signature"}:
+            continue
+        parts.append(item)
+    if not any(item.startswith("uifid=") for item in parts):
+        parts.append(f"uifid={uifid}")
+    parts.append(f"timestamp={ts}")
+    signed_query = "&".join(parts)
+    payload = f"{uifid}_{ts}_{WEB_SIGN_SALT}_{signed_query}"
+    signature = hashlib.md5(payload.encode("utf-8")).hexdigest()
+    signed_url = f"{head}?{signed_query}&x-secsdk-web-signature={signature}"
+    return signed_url, {
+        "uifid": uifid,
+        "x-secsdk-web-signature": signature,
+        "x-secsdk-web-expire": ts,
+    }
+
+
+def _params_dict(aweme_id: str, profile: BrowserProfile, ms_token: str, cookie: str = "") -> dict:
     params = PostDetail(aweme_id=aweme_id)
     data = params.dict() if hasattr(params, "dict") else params.model_dump()
     data["msToken"] = ms_token
@@ -240,6 +285,14 @@ def _params_dict(aweme_id: str, profile: BrowserProfile, ms_token: str) -> dict:
     data["engine_version"] = profile.engine_version
     data["browser_name"] = profile.browser_name
     data["engine_name"] = profile.engine_name
+    # ArgusSecurityPlugin 查的是查询参数 uifid，不是 Cookie 里同名键本身
+    uifid, _source = resolve_uifid(cookie)
+    if uifid:
+        data["uifid"] = uifid
+    verify_fp = cookie_value(cookie, "s_v_web_id")
+    if verify_fp:
+        data["verifyFp"] = verify_fp
+        data["fp"] = verify_fp
     return data
 
 
@@ -250,41 +303,58 @@ async def fetch_aweme_detail(
     has_cffi: bool,
     profile: BrowserProfile | None = None,
 ) -> dict:
-    """请求 aweme/detail。curl_cffi 遇 403 立即换指纹，不再对同一 impersonate 空转重签。"""
+    """请求 aweme/detail。失败重新签名最多 2 次。不要用 Chrome TLS impersonate 打此接口。"""
     profile = profile or active_profile(has_cffi)
     ms_token, ms_source = resolve_ms_token(cookie)
     if not ms_token:
         logger.warning("msToken 为空（cookie 无此字段且生成失败），禁止再写死空串之外已无值可填")
+    uifid, uifid_source = resolve_uifid(cookie)
+    if not uifid:
+        logger.warning("uifid 为空（cookie 无 UIFID / UIFID_TEMP），Argus 会直接 403")
     headers = {
         "Referer": "https://www.douyin.com/",
-        "Accept": "application/json",
+        "Origin": "https://www.douyin.com",
+        "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9",
     }
     if cookie:
         headers["Cookie"] = cookie
+    if uifid:
+        headers["uifid"] = uifid
     if not has_cffi:
         headers["User-Agent"] = profile.ua
 
     last_status = None
     last_kind = "empty"
     for attempt in range(1, WEB_API_ATTEMPTS + 1):
-        params_dict = _params_dict(aweme_id, profile, ms_token)
+        params_dict = _params_dict(aweme_id, profile, ms_token, cookie)
         a_bogus = BogusManager.ab_model_2_endpoint(params_dict, profile.ua)
         endpoint = f"{DouyinAPIEndpoints.POST_DETAIL}?{urlencode(params_dict)}&a_bogus={a_bogus}"
+        req_headers = dict(headers)
+        web_sign = "no"
+        if uifid:
+            endpoint, sign_headers = apply_secsdk_web_sign(endpoint, uifid)
+            req_headers.update(sign_headers)
+            web_sign = "md5"
         logger.info(
-            "Web API 详情 aweme_id=%s impersonate=%s sign_ua=%s msToken_source=%s attempt=%s/%s",
+            "Web API 详情 aweme_id=%s client=%s sign_ua=%s msToken_source=%s uifid_source=%s uifid_len=%s a_bogus_len=%s uifid_header=%s web_sign=%s attempt=%s/%s",
             aweme_id,
-            profile.impersonate or "httpx",
+            "curl_cffi" if has_cffi else "httpx",
             profile.ua,
             ms_source,
+            uifid_source,
+            len(uifid),
+            len(a_bogus),
+            "yes" if uifid else "no",
+            web_sign,
             attempt,
             WEB_API_ATTEMPTS,
         )
         try:
-            resp = await client.get(endpoint, headers=headers)
+            resp = await client.get(endpoint, headers=req_headers)
         except Exception as exc:
             last_kind = "connect"
-            logger.warning("Web API 请求失败 impersonate=%s attempt=%s: %s", profile.impersonate or "httpx", attempt, exc)
+            logger.warning("Web API 请求失败 client=%s attempt=%s: %s", "curl_cffi" if has_cffi else "httpx", attempt, exc)
             if attempt == WEB_API_ATTEMPTS:
                 raise WebApiError("connect", "无法连接抖音服务器，请检查 NAS 网络后重试")
             continue
@@ -294,45 +364,40 @@ async def fetch_aweme_detail(
         if last_status == 403:
             last_kind = "forbidden"
             logger.warning(
-                "Web API 403 impersonate=%s attempt=%s %s",
-                profile.impersonate or "httpx",
+                "Web API 403 client=%s attempt=%s %s",
+                "curl_cffi" if has_cffi else "httpx",
                 attempt,
                 _body_hint(text),
             )
-            # 同一 TLS 指纹再签仍是 403；换 impersonate 才有意义
-            if has_cffi:
-                raise WebApiError("forbidden", "抖音风控拦截了最高清晰度接口（HTTP 403）", last_status)
             continue
         if last_status != 200:
             last_kind = "http"
             logger.warning(
-                "Web API HTTP %s impersonate=%s attempt=%s %s",
+                "Web API HTTP %s client=%s attempt=%s %s",
                 last_status,
-                profile.impersonate or "httpx",
+                "curl_cffi" if has_cffi else "httpx",
                 attempt,
                 _body_hint(text),
             )
             continue
         if not text.strip():
             last_kind = "empty"
-            logger.warning("Web API 空包 impersonate=%s attempt=%s", profile.impersonate or "httpx", attempt)
+            logger.warning("Web API 空包 client=%s attempt=%s", "curl_cffi" if has_cffi else "httpx", attempt)
             continue
         if _looks_html(text):
             last_kind = "forbidden"
             logger.warning(
-                "Web API 返回验证页 HTML impersonate=%s attempt=%s %s",
-                profile.impersonate or "httpx",
+                "Web API 返回验证页 HTML client=%s attempt=%s %s",
+                "curl_cffi" if has_cffi else "httpx",
                 attempt,
                 _html_hint(text),
             )
-            if has_cffi:
-                raise WebApiError("forbidden", "抖音风控拦截了最高清晰度接口（HTTP 403）", last_status)
             continue
         try:
             payload = resp.json()
         except Exception:
             last_kind = "empty"
-            logger.warning("Web API 非 JSON impersonate=%s attempt=%s prefix=%r", profile.impersonate or "httpx", attempt, text[:80])
+            logger.warning("Web API 非 JSON client=%s attempt=%s prefix=%r", "curl_cffi" if has_cffi else "httpx", attempt, text[:80])
             continue
         if not isinstance(payload, dict):
             last_kind = "empty"
@@ -341,8 +406,8 @@ async def fetch_aweme_detail(
         if not isinstance(detail, dict):
             last_kind = "empty"
             logger.warning(
-                "Web API aweme_detail 为空 impersonate=%s attempt=%s keys=%s",
-                profile.impersonate or "httpx",
+                "Web API aweme_detail 为空 client=%s attempt=%s keys=%s",
+                "curl_cffi" if has_cffi else "httpx",
                 attempt,
                 list(payload.keys())[:8],
             )
@@ -352,9 +417,9 @@ async def fetch_aweme_detail(
         if not isinstance(bit_rate, list) or not bit_rate:
             raise WebApiError("no_bit_rate", "详情接口未返回清晰度列表", last_status)
         logger.info(
-            "Web API 成功 aweme_id=%s impersonate=%s bit_rate档数=%s",
+            "Web API 成功 aweme_id=%s client=%s bit_rate档数=%s",
             aweme_id,
-            profile.impersonate or "httpx",
+            "curl_cffi" if has_cffi else "httpx",
             len(bit_rate),
         )
         return payload

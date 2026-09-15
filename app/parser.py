@@ -1,8 +1,8 @@
 """抖音分享链接最小解析器（支持批量）。
 
-主路径：硬化后的 Web API `aweme/detail`（curl_cffi + 真 msToken + UA/签名对齐），
+主路径：Web API `aweme/detail`（httpx + 真 msToken + cookie UIFID + a_bogus），
 从 `video.bit_rate` 按分辨率优先选出最高档。
-备路径：分享页 / 详情页 HTML，只保证能解析，标记为非最高档。
+备路径：分享页 / 详情页 HTML（curl_cffi），只保证能解析，标记为非最高档。
 """
 from __future__ import annotations
 
@@ -238,6 +238,17 @@ def _make_http_client(timeout: float, impersonate: str | None = None):
                 logger.warning("impersonate=%s 不可用: %s", name, exc)
         raise RuntimeError(f"无法创建 curl_cffi 会话: {last_error}")
     transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+    return httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(timeout),
+        transport=transport,
+    )
+
+
+def _make_web_api_client(timeout: float):
+    """详情接口不用 curl_cffi。Chrome TLS 会打开 Argus，接着要浏览器 Signature。"""
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+    logger.info("Web API 会话 httpx")
     return httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(timeout),
@@ -752,63 +763,25 @@ async def _parse_via_upstream(client: httpx.AsyncClient, url: str) -> ParsedVide
 
 
 async def _parse_via_web_api(url: str, cookie: str, aweme_id: str) -> ParsedVideo:
-    from crawlers.douyin.web.web_crawler import (
-        WebApiError,
-        api_profile_chain,
-        fetch_aweme_detail,
-        impersonate_names,
-    )
+    from crawlers.douyin.web.web_crawler import CHROME90, WebApiError, fetch_aweme_detail
 
-    last_error: Exception | None = None
-    chain = api_profile_chain(_HAS_CFFI)
-    for index, profile in enumerate(chain):
-        names = impersonate_names(profile) if _HAS_CFFI else [None]
-        opened = False
-        for name in names:
-            client = None
-            try:
-                client = _make_http_client(config.HTTP_TIMEOUT, impersonate=name)
-            except Exception as exc:
-                logger.warning("无法创建 Web API 会话 impersonate=%s: %s", name or profile.impersonate, exc)
-                last_error = exc
-                continue
-            opened = True
-            try:
-                raw = await fetch_aweme_detail(
-                    aweme_id, cookie, client, has_cffi=_HAS_CFFI, profile=profile
-                )
-            except WebApiError as exc:
-                last_error = exc
-                logger.warning(
-                    "Web API 指纹失败 impersonate=%s kind=%s status=%s",
-                    profile.impersonate or "httpx",
-                    exc.kind,
-                    exc.status,
-                )
-            except Exception as exc:
-                last_error = exc
-                logger.warning("Web API 请求异常 impersonate=%s: %s", profile.impersonate or "httpx", exc)
-            else:
-                detail = raw.get("aweme_detail") if isinstance(raw, dict) else None
-                if not isinstance(detail, dict):
-                    last_error = WebApiError("empty", "最高清晰度接口未返回作品数据")
-                else:
-                    pick = _pick_bit_rate(detail.get("video") or {})
-                    return _build_parsed(detail, aweme_id, url, quality_source="web-api", play=pick)
-            finally:
-                if client is not None:
-                    await _close_http_client(client)
-            break
-        if not opened:
-            continue
-        if index < len(chain) - 1:
-            await asyncio.sleep(0.4)
-    logger.warning("Web API 已试完 impersonate 链仍失败，停止盲试")
-    if isinstance(last_error, WebApiError):
-        raise last_error
-    if last_error:
-        raise WebApiError("http", str(last_error))
-    raise WebApiError("forbidden", "抖音风控拦截了最高清晰度接口（HTTP 403）")
+    client = _make_web_api_client(config.HTTP_TIMEOUT)
+    try:
+        raw = await fetch_aweme_detail(
+            aweme_id, cookie, client, has_cffi=False, profile=CHROME90
+        )
+        detail = raw.get("aweme_detail") if isinstance(raw, dict) else None
+        if not isinstance(detail, dict):
+            raise WebApiError("empty", "最高清晰度接口未返回作品数据")
+        pick = _pick_bit_rate(detail.get("video") or {})
+        return _build_parsed(detail, aweme_id, url, quality_source="web-api", play=pick)
+    except WebApiError:
+        raise
+    except Exception as exc:
+        logger.warning("Web API 请求异常 client=httpx: %s", exc)
+        raise WebApiError("http", str(exc))
+    finally:
+        await _close_http_client(client)
 
 
 async def _parse_via_html(client, url: str, cookie: str, aweme_id: str) -> ParsedVideo:
@@ -871,10 +844,9 @@ def _inject_cookie(cookie: str) -> None:
 
 
 def parse_health() -> dict:
-    from crawlers.douyin.web.web_crawler import api_profile_chain, cookie_value, html_impersonate_names
+    from crawlers.douyin.web.web_crawler import cookie_value, html_impersonate_names
 
     cookie = config.load_cookie()
-    chain = api_profile_chain(_HAS_CFFI)
     if config.UPSTREAM_API:
         parse_mode = "upstream"
         parser_name = "upstream"
@@ -885,11 +857,14 @@ def parse_health() -> dict:
         "parser": parser_name,
         "parse_mode": parse_mode,
         "http_client": "curl_cffi" if _HAS_CFFI else "httpx",
-        "impersonate": chain[0].impersonate or "",
-        "impersonate_chain": ",".join(p.impersonate or "httpx" for p in chain),
+        "web_api_client": "httpx",
+        "impersonate": "",
+        "impersonate_chain": "httpx",
         "html_impersonate": ",".join(html_impersonate_names()) if _HAS_CFFI else "",
         "cookie_has_sessionid": bool(cookie_value(cookie, "sessionid")),
         "cookie_has_mstoken": bool(cookie_value(cookie, "msToken")),
+        "cookie_has_uifid": bool(cookie_value(cookie, "UIFID") or cookie_value(cookie, "UIFID_TEMP")),
+        "cookie_has_secsdk_key": bool(cookie_value(cookie, "__security_mc_1_s_sdk_sign_data_key_web_protect")),
     }
 
 
@@ -931,13 +906,11 @@ async def iter_parse_urls(urls: list[str]):
     if use_upstream:
         logger.info("解析走 HTTP 上游: %s", config.UPSTREAM_API)
     else:
-        from crawlers.douyin.web.web_crawler import api_profile_chain, html_impersonate_names
+        from crawlers.douyin.web.web_crawler import html_impersonate_names
 
-        chain = api_profile_chain(_HAS_CFFI)
         logger.info(
-            "解析走 Web API 主路径 + HTML 兜底 http_client=%s impersonate_chain=%s html_impersonate=%s",
+            "解析走 Web API 主路径 + HTML 兜底 web_api_client=httpx html_client=%s html_impersonate=%s",
             "curl_cffi" if _HAS_CFFI else "httpx",
-            ",".join(p.impersonate or "httpx" for p in chain),
             ",".join(html_impersonate_names()) if _HAS_CFFI else "httpx",
         )
         _inject_cookie(cookie)
