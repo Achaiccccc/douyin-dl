@@ -18,11 +18,18 @@
     resultSummary: document.getElementById("result-summary"),
     resultList: document.getElementById("result-list"),
     btnAgain: document.getElementById("btn-again"),
+    btnDownloadPage: document.getElementById("btn-download-page"),
+    btnMore: document.getElementById("btn-more"),
   };
 
   var currentResults = [];
   var parseTotal = 0;
   var parsing = false;
+  var downloading = false;
+  var parseTruncated = false;
+  var userPager = null;
+  var awaitingMore = false;
+  var streamGotStart = false;
 
   function show(name) {
     Object.keys(views).forEach(function (key) {
@@ -132,15 +139,66 @@
 
   function finishParse() {
     parsing = false;
-    els.btnAgain.disabled = false;
+    awaitingMore = false;
     if (els.btnClear) els.btnClear.disabled = false;
     setLoading(els.btnParse, false);
+    updateResultActions();
     renderSummary();
   }
 
+  function updateResultActions() {
+    var okCount = currentResults.filter(function (r) {
+      return r && r.ok;
+    }).length;
+    if (els.btnDownloadPage) {
+      els.btnDownloadPage.disabled = parsing || downloading || okCount === 0;
+    }
+    if (els.btnAgain) {
+      els.btnAgain.disabled = parsing || downloading;
+    }
+    if (els.btnMore) {
+      var showMore = !parsing && !downloading && !!(userPager && userPager.has_more);
+      els.btnMore.classList.toggle("hidden", !showMore);
+      els.btnMore.disabled = !showMore;
+    }
+  }
+
   function handleStreamEvent(evt) {
+    if (evt.event === "listing") {
+      els.resultSummary.textContent = evt.message || "正在拉取主页作品列表…";
+      return;
+    }
+    if (evt.event === "error") {
+      if (awaitingMore && !streamGotStart && currentResults.length) {
+        finishParse();
+        els.resultSummary.textContent = evt.message || "下一页解析失败，当前页结果仍保留";
+        return;
+      }
+      finishParse();
+      show("main");
+      showError(els.parseError, evt.message || "解析失败");
+      return;
+    }
     if (evt.event === "start") {
+      streamGotStart = true;
+      if (evt.mode === "user") {
+        if (userPager) {
+          userPager.offset += parseTotal;
+          userPager.page += 1;
+        } else {
+          userPager = { page: 1, offset: 0 };
+        }
+        userPager.sec_user_id = evt.sec_user_id || userPager.sec_user_id || "";
+        userPager.next_cursor = evt.next_cursor || 0;
+        userPager.has_more = !!evt.has_more;
+        parseTruncated = !!evt.has_more;
+      } else {
+        userPager = null;
+        parseTruncated = false;
+      }
       initPlaceholders(evt.total || 0);
+      if (els.btnDownloadPage) els.btnDownloadPage.textContent = "一键下载";
+      updateResultActions();
       return;
     }
     if (evt.event === "item") {
@@ -151,6 +209,12 @@
       return;
     }
     if (evt.event === "done") {
+      if (evt.mode === "user" && userPager) {
+        userPager.sec_user_id = evt.sec_user_id || userPager.sec_user_id || "";
+        userPager.next_cursor = evt.next_cursor || 0;
+        userPager.has_more = !!evt.has_more;
+      }
+      parseTruncated = parseTruncated || !!evt.truncated || !!(userPager && userPager.has_more);
       finishParse();
     }
   }
@@ -202,12 +266,17 @@
     hideError(els.parseError);
     setLoading(els.btnParse, true, "解析中…");
     parsing = true;
+    downloading = false;
     parseTotal = 0;
+    parseTruncated = false;
+    userPager = null;
+    awaitingMore = false;
+    streamGotStart = false;
     currentResults = [];
     els.resultList.innerHTML = "";
     els.resultSummary.textContent = "正在识别链接…";
-    els.btnAgain.disabled = true;
     if (els.btnClear) els.btnClear.disabled = true;
+    updateResultActions();
     show("result");
 
     fetch("/api/parse", {
@@ -236,6 +305,60 @@
         return consumeNdjson(resp);
       })
       .catch(function (err) {
+        if (awaitingMore && currentResults.length) {
+          finishParse();
+          els.resultSummary.textContent = err.message || "下一页解析失败，当前页结果仍保留";
+          return;
+        }
+        finishParse();
+        show("main");
+        showError(els.parseError, err.message);
+      });
+  }
+
+  function doParseMore() {
+    if (parsing || downloading || !userPager || !userPager.has_more || !userPager.sec_user_id) {
+      return;
+    }
+    parsing = true;
+    awaitingMore = true;
+    streamGotStart = false;
+    els.resultSummary.textContent = "正在拉取下一页作品…";
+    updateResultActions();
+    fetch("/api/parse_more", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sec_user_id: userPager.sec_user_id,
+        cursor: userPager.next_cursor || 0,
+      }),
+    })
+      .then(function (resp) {
+        if (resp.status === 401) {
+          show("login");
+          throw new Error("登录已过期，请重新输入密码");
+        }
+        if (!resp.ok) {
+          return resp.json().then(function (data) {
+            var detail = data && data.detail;
+            if (Array.isArray(detail)) {
+              detail = detail
+                .map(function (d) {
+                  return d.msg;
+                })
+                .join("；");
+            }
+            throw new Error(detail || "请求失败（" + resp.status + "）");
+          });
+        }
+        return consumeNdjson(resp);
+      })
+      .catch(function (err) {
+        if (currentResults.length) {
+          finishParse();
+          els.resultSummary.textContent = err.message || "下一页解析失败，当前页结果仍保留";
+          return;
+        }
         finishParse();
         show("main");
         showError(els.parseError, err.message);
@@ -254,13 +377,39 @@
       return r && !r.pending && !r.ok;
     }).length;
     var done = ok + failed;
+    var pagePrefix = userPager ? "第 " + userPager.page + " 页 · " : "";
+    var extra = "";
+    if (userPager && userPager.has_more) {
+      extra = "，还可继续翻页";
+    } else if (userPager && userPager.page > 1) {
+      extra = "，已全部拉完";
+    } else if (parseTruncated) {
+      extra = "（达到上限，未拉完该主页）";
+    }
     if (parsing || pending) {
       els.resultSummary.textContent =
-        "解析中 " + done + "/" + total + "，成功 " + ok + " 条" + (failed ? "，失败 " + failed + " 条" : "");
+        pagePrefix +
+        "解析中 " +
+        done +
+        "/" +
+        total +
+        "，成功 " +
+        ok +
+        " 条" +
+        (failed ? "，失败 " + failed + " 条" : "") +
+        extra;
     } else {
       els.resultSummary.textContent =
-        "共 " + total + " 条，成功 " + ok + " 条" + (failed ? "，失败 " + failed + " 条" : "");
+        pagePrefix +
+        (userPager ? "本页 " : "共 ") +
+        total +
+        " 条，成功 " +
+        ok +
+        " 条" +
+        (failed ? "，失败 " + failed + " 条" : "") +
+        extra;
     }
+    updateResultActions();
   }
 
   function buildItemCard(item, index) {
@@ -270,8 +419,13 @@
       "card item" + (pending ? " item-pending" : item.ok ? "" : " item-failed");
 
     var indexEl = document.createElement("span");
+    var offset = userPager ? userPager.offset : 0;
     indexEl.className = "item-index";
-    indexEl.textContent = index + 1 + "/" + (parseTotal || currentResults.length || 1);
+    if (userPager) {
+      indexEl.textContent = String(offset + index + 1);
+    } else {
+      indexEl.textContent = index + 1 + "/" + (parseTotal || currentResults.length || 1);
+    }
     card.appendChild(indexEl);
 
     if (pending) {
@@ -468,6 +622,63 @@
     next();
   }
 
+  function collectDownloadJobs() {
+    var jobs = [];
+    currentResults.forEach(function (item, idx) {
+      if (!item || !item.ok) return;
+      if (item.type === "image" && item.images && item.images.length) {
+        item.images.forEach(function (img, n) {
+          jobs.push({
+            url: img.url,
+            name:
+              "image-" +
+              String(idx + 1).padStart(2, "0") +
+              "-" +
+              String(n + 1).padStart(2, "0"),
+          });
+        });
+      } else if (item.download_url) {
+        jobs.push({
+          url: item.download_url,
+          name: "video-" + String(idx + 1).padStart(2, "0") + ".mp4",
+        });
+      }
+    });
+    return jobs;
+  }
+
+  function downloadCurrentPage() {
+    if (parsing || downloading || !els.btnDownloadPage) return;
+    var jobs = collectDownloadJobs();
+    if (!jobs.length) return;
+    downloading = true;
+    var btn = els.btnDownloadPage;
+    var i = 0;
+    var failed = 0;
+    updateResultActions();
+    function next() {
+      if (i >= jobs.length) {
+        downloading = false;
+        btn.textContent = failed
+          ? "一键下载（失败 " + failed + " 个）"
+          : "一键下载";
+        updateResultActions();
+        return;
+      }
+      btn.textContent = "下载中 " + (i + 1) + "/" + jobs.length;
+      btn.disabled = true;
+      downloadBlob(jobs[i].url, jobs[i].name)
+        .catch(function () {
+          failed += 1;
+        })
+        .then(function () {
+          i += 1;
+          setTimeout(next, 600);
+        });
+    }
+    next();
+  }
+
   function doRetry(index, btn) {
     var item = currentResults[index];
     if (!item) return;
@@ -491,11 +702,20 @@
   if (els.btnClear) {
     els.btnClear.addEventListener("click", clearShareText);
   }
+  if (els.btnDownloadPage) {
+    els.btnDownloadPage.addEventListener("click", downloadCurrentPage);
+  }
+  if (els.btnMore) {
+    els.btnMore.addEventListener("click", doParseMore);
+  }
   els.btnAgain.addEventListener("click", function () {
-    if (parsing) return;
+    if (parsing || downloading) return;
     els.shareText.value = "";
     currentResults = [];
     parseTotal = 0;
+    parseTruncated = false;
+    userPager = null;
+    awaitingMore = false;
     hideError(els.parseError);
     show("main");
     els.shareText.focus();

@@ -28,6 +28,8 @@
 
 - 访问密码登录（session 约 7 天，失败限流）
 - 粘贴抖音分享文案 / 链接，一次最多 30 条，流式出结果；失败条目可单独重试
+- 用户主页分享文案：自动识别并拉取已发布作品；每页约 100 条，结果页可「继续解析下一页」直到拉完
+- 结果页「一键下载」：按序下载当前页全部成功结果（视频 + 图文）
 - 视频：优先 Web API `aweme/detail` 的 `bit_rate` 最高分辨率档（不是分享页把 `ratio=` 调大）。容器里还要 secsdk `x-secsdk-web-signature`；若详情接口被拦，会回落到页面档并在卡片上标明「非最高清晰度」
 - 图文：解析全部无水印原图，逐张代理下载，也可一键按序下载全部
 - 封面 / 图片均走本站代理，不把抖音直链暴露给浏览器
@@ -71,6 +73,17 @@ docker compose up -d --build
 ![在浏览器开发者工具中复制 Cookie](cookie-example.png)
 
 ## 本地开发
+
+Windows 一键启动（首次自动创建 `.venv` 并安装依赖，之后直接起服务）：
+
+```powershell
+cd douyin-dl
+.\start-local.ps1
+```
+
+需要重装依赖时：`.\start-local.ps1 -Update`。也可双击 `start-local.bat`。默认地址 `http://127.0.0.1:8080/`，访问密码 `123456`（可用环境变量 `APP_PASSWORD` / `PORT` 覆盖）。
+
+手动启动：
 
 ```bash
 python -m venv .venv
@@ -129,6 +142,8 @@ douyin-dl/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
+├── start-local.ps1      # Windows 一键启动本机测试服务
+├── start-local.bat      # 双击启动（调用 start-local.ps1）
 ├── LICENSE              # Apache-2.0
 └── README.md
 ```
@@ -141,7 +156,8 @@ douyin-dl/
 |------|------|
 | `POST /api/login` | 密码登录 |
 | `GET /api/me` | 登录状态 |
-| `POST /api/parse` | 批量解析（NDJSON 流式返回） |
+| `POST /api/parse` | 批量解析（NDJSON：`listing` / `start` / `item` / `done`；主页链接先拉一页列表再出卡片） |
+| `POST /api/parse_more` | 主页下一页（`sec_user_id` + `cursor`） |
 | `POST /api/parse_one` | 单条重试 |
 | `GET /api/cover?id=` | 封面代理 |
 | `GET /api/image?id=&i=` | 图文单张代理下载 |

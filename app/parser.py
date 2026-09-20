@@ -43,15 +43,20 @@ DESKTOP_UA = (
 )
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]*douyin\.com/[^\s\"'<>，。！；）】]*")
-_BARE_SHORT_RE = re.compile(r"v\.douyin\.com/[A-Za-z0-9]+/?")
+_BARE_SHORT_RE = re.compile(r"v\.douyin\.com/[A-Za-z0-9_-]+/?")
 _AWEME_RE = re.compile(r"/(?:video|note)/(\d{6,})")
 _MODAL_RE = re.compile(r"[?&]modal_id=(\d{6,})")
+_USER_PATH_RE = re.compile(r"/(?:share/)?user/([^/?#]+)")
+_SEC_UID_RE = re.compile(r"[?&]sec_uid=([^&]+)")
+_SEC_USER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,200}$")
 _ROUTER_DATA_RE = re.compile(r"window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>", re.DOTALL)
 _RENDER_DATA_RE = re.compile(
     r'<script id="RENDER_DATA" type="application/json">(.*?)</script>', re.DOTALL
 )
 
 MAX_BATCH = 30
+MAX_USER_POSTS = 100
+USER_POST_PAGE_SIZE = 18
 MAX_CONCURRENCY = 2
 # 批量时每条请求前的随机间隔，降低触发抖音风控的概率
 BATCH_DELAY_RANGE = (0.3, 1.0)
@@ -65,6 +70,10 @@ RISK_OR_COOKIE_HINT = (
 )
 WEBAPI_403_HINT = (
     "抖音风控拦截了最高清晰度接口（HTTP 403），页面档也未能解析。"
+    "请稍后重试；若多次失败请更新 cookie.txt 后重启容器"
+)
+USER_POST_403_HINT = (
+    "抖音风控拦截了主页作品列表（HTTP 403）。"
     "请稍后重试；若多次失败请更新 cookie.txt 后重启容器"
 )
 HTML_ONLY_HINT = "未能取到最高清晰度，当前为页面档（样本约 2MB）"
@@ -160,6 +169,41 @@ def extract_urls(text: str) -> list[str]:
 def _aweme_id_from(url: str) -> str | None:
     match = _AWEME_RE.search(url) or _MODAL_RE.search(url)
     return match.group(1) if match else None
+
+
+def _sec_user_id_from(url: str) -> str | None:
+    match = _USER_PATH_RE.search(url)
+    if match:
+        return unquote(match.group(1)).strip() or None
+    match = _SEC_UID_RE.search(url)
+    if match:
+        return unquote(match.group(1)).strip() or None
+    return None
+
+
+def _peek_link_kind(url: str) -> str:
+    """不发请求：video | user | unknown（短链需跟随重定向）。"""
+    if _AWEME_RE.search(url):
+        return "video"
+    if _USER_PATH_RE.search(url) or _SEC_UID_RE.search(url):
+        return "user"
+    if _MODAL_RE.search(url):
+        return "video"
+    return "unknown"
+
+
+def _classify_resolved_url(url: str) -> tuple[str, str]:
+    """按最终 URL 判断主页 / 作品。路径优先：/video|/note 为作品，/user 为主页。"""
+    if _AWEME_RE.search(url):
+        aweme_id = _aweme_id_from(url) or ""
+        return "video", aweme_id
+    sec_user_id = _sec_user_id_from(url)
+    if sec_user_id:
+        return "user", sec_user_id
+    aweme_id = _aweme_id_from(url)
+    if aweme_id:
+        return "video", aweme_id
+    return "unknown", ""
 
 
 def _headers(
@@ -610,6 +654,27 @@ async def _resolve_aweme_id(client, url: str, cookie: str) -> str:
     return aweme_id
 
 
+async def _resolve_link(client, url: str, cookie: str) -> tuple[str, str]:
+    """跟随短链，返回 (kind, ident)，kind 为 user | video。"""
+    kind, ident = _classify_resolved_url(url)
+    if kind != "unknown" and ident:
+        return kind, ident
+    try:
+        resp = await client.get(url, headers=_headers(MOBILE_UA, cookie))
+    except Exception as exc:
+        logger.warning("短链打开失败: %s (%s)", url, exc)
+        raise ParseError("短链接打开失败，请稍后重试", 502)
+    final = str(resp.url)
+    kind, ident = _classify_resolved_url(final)
+    if kind == "unknown" or not ident:
+        kind, ident = _classify_resolved_url(resp.text[:200000])
+    if kind == "unknown" or not ident:
+        logger.warning("短链无法识别主页或作品: final=%s %s", resp.url, _page_hint(resp.text))
+        raise ParseError("无法识别该链接是作品还是用户主页", 502)
+    logger.info("短链分类 kind=%s ident=%s final=%s", kind, ident[:24], final)
+    return kind, ident
+
+
 async def _fetch_detail_once(client, aweme_id: str, cookie: str) -> tuple[ParsedVideo | None, bool]:
     """返回 (解析结果, 页面是否成功返回)。细节进容器日志。"""
     page_ok = False
@@ -878,6 +943,154 @@ def _get_crawler():
     return _crawler
 
 
+def _canonical_aweme_url(aweme: dict) -> str:
+    aweme_id = str(aweme.get("aweme_id") or "")
+    images = _pick_images(aweme)
+    aweme_type = aweme.get("aweme_type")
+    if images and (aweme_type in IMAGE_AWEME_TYPES or aweme_type is None):
+        return f"https://www.douyin.com/note/{aweme_id}"
+    return f"https://www.douyin.com/video/{aweme_id}"
+
+
+def _from_user_list_item(detail: dict) -> ParsedVideo | None:
+    """列表项已带 bit_rate 或图文时直接建卡，否则返回 None 走分层解析。"""
+    aweme_id = str(detail.get("aweme_id") or "")
+    if not aweme_id:
+        return None
+    source_url = _canonical_aweme_url(detail)
+    images = _pick_images(detail)
+    aweme_type = detail.get("aweme_type")
+    video_node = detail.get("video") or {}
+    pick = _pick_bit_rate(video_node)
+    is_image = bool(images) and (
+        aweme_type in IMAGE_AWEME_TYPES or aweme_type is None or not pick
+    )
+    if is_image:
+        return _build_parsed(detail, aweme_id, source_url, quality_source="web-api")
+    if pick:
+        return _build_parsed(detail, aweme_id, source_url, quality_source="web-api", play=pick)
+    return None
+
+
+def _user_post_error(exc) -> ParseError:
+    kind = getattr(exc, "kind", "")
+    if kind == "forbidden":
+        return ParseError(USER_POST_403_HINT, 502)
+    if kind == "connect":
+        return ParseError("无法连接抖音服务器，请检查 NAS 网络后重试", 502)
+    message = str(exc) or RISK_OR_COOKIE_HINT
+    return ParseError(message if "Cookie" in message or "连接" in message else RISK_OR_COOKIE_HINT, 502)
+
+
+async def _fetch_user_aweme_list(
+    sec_user_id: str,
+    cookie: str,
+    start_cursor: int = 0,
+) -> tuple[list[dict], bool, int]:
+    """从 start_cursor 起拉一页作品（API 页对齐，约 100 条）。返回 (列表, 是否还有更多, 下一页 cursor)。"""
+    from crawlers.douyin.web.web_crawler import CHROME90, WebApiError, fetch_user_post_page
+
+    client = _make_web_api_client(config.HTTP_TIMEOUT)
+    items: list[dict] = []
+    cursor = int(start_cursor or 0)
+    has_more = True
+    page_no = 0
+    try:
+        while has_more and len(items) < MAX_USER_POSTS:
+            if page_no:
+                await asyncio.sleep(random.uniform(*BATCH_DELAY_RANGE))
+            page_no += 1
+            try:
+                page = await fetch_user_post_page(
+                    sec_user_id,
+                    cursor,
+                    USER_POST_PAGE_SIZE,
+                    cookie,
+                    client,
+                    has_cffi=False,
+                    profile=CHROME90,
+                )
+            except WebApiError as exc:
+                raise _user_post_error(exc) from exc
+            chunk = [a for a in (page.get("aweme_list") or []) if isinstance(a, dict)]
+            items.extend(chunk)
+            has_more = bool(page.get("has_more"))
+            try:
+                next_cursor = int(page.get("max_cursor") or 0)
+            except (TypeError, ValueError):
+                next_cursor = 0
+            if not chunk:
+                has_more = False
+            elif has_more and next_cursor == cursor:
+                logger.warning("主页列表 cursor 未前进，停止分页 sec_user_id=%s", sec_user_id[:16])
+                has_more = False
+            else:
+                cursor = next_cursor
+        logger.info(
+            "主页列表一页完成 sec_user_id=%s start=%s count=%s has_more=%s next_cursor=%s pages=%s",
+            sec_user_id[:16],
+            start_cursor,
+            len(items),
+            has_more,
+            cursor,
+            page_no,
+        )
+        return items, has_more, cursor
+    finally:
+        await _close_http_client(client)
+
+
+async def _parse_user_aweme(html_client, cookie: str, aweme: dict) -> ParsedVideo:
+    aweme_id = str(aweme.get("aweme_id") or "")
+    source_url = _canonical_aweme_url(aweme) if aweme_id else ""
+    cached = get_cached(aweme_id) if aweme_id else None
+    if cached:
+        cached.source_url = cached.source_url or source_url
+        return cached
+    try:
+        video = _from_user_list_item(aweme)
+        if video:
+            return video
+    except ParseError:
+        logger.info("主页列表项无法直接建卡，改走分层解析 aweme_id=%s", aweme_id)
+    if not source_url:
+        raise ParseError("主页作品缺少 ID", 502)
+    return await _parse_layered(html_client, source_url, cookie)
+
+
+async def iter_parse_user_awemes(awemes: list[dict], html_client, cookie: str):
+    """主页作品逐条产出 (index, ParseItem)。"""
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+    queue: asyncio.Queue[tuple[int, ParseItem]] = asyncio.Queue()
+    use_upstream = bool(config.UPSTREAM_API)
+
+    async def run_one(aweme: dict) -> ParsedVideo:
+        if use_upstream:
+            url = _canonical_aweme_url(aweme)
+            timeout = httpx.Timeout(config.UPSTREAM_TIMEOUT)
+            async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as upstream:
+                return await _parse_via_upstream(upstream, url)
+        return await _parse_user_aweme(html_client, cookie, aweme)
+
+    async def worker(index: int, aweme: dict) -> None:
+        url = _canonical_aweme_url(aweme) if isinstance(aweme, dict) else ""
+        async with semaphore:
+            await asyncio.sleep(random.uniform(*BATCH_DELAY_RANGE))
+            try:
+                item = ParseItem(url=url, video=await run_one(aweme))
+            except ParseError as exc:
+                logger.info("主页作品解析失败 %s: %s", url, exc)
+                item = ParseItem(url=url, error=str(exc))
+            await queue.put((index, item))
+
+    tasks = [asyncio.create_task(worker(i, a)) for i, a in enumerate(awemes)]
+    try:
+        for _ in awemes:
+            yield await queue.get()
+    finally:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def iter_parse_urls(urls: list[str]):
     """逐条产出 (index, ParseItem)，完成一条 yield 一条。"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -923,6 +1136,122 @@ async def iter_parse_urls(urls: list[str]):
         await asyncio.gather(*tasks, return_exceptions=True)
         if client is not None:
             await _close_http_client(client)
+
+
+async def _iter_user_job(
+    html_client,
+    cookie: str,
+    source_url: str,
+    sec_user_id: str,
+    cursor: int = 0,
+):
+    yield {
+        "event": "listing",
+        "message": "正在拉取下一页作品…" if cursor else "正在拉取主页作品列表…",
+    }
+    if not cookie:
+        yield {"event": "error", "message": "未配置 Cookie：请在 NAS 上放入 cookie.txt 后重启容器"}
+        return
+    _inject_cookie(cookie)
+    try:
+        awemes, has_more, next_cursor = await _fetch_user_aweme_list(
+            sec_user_id, cookie, start_cursor=cursor
+        )
+    except ParseError as exc:
+        yield {"event": "error", "message": str(exc)}
+        return
+    if not awemes:
+        yield {
+            "event": "error",
+            "message": "该主页没有更多公开作品" if cursor else "该主页没有公开作品，或账号已设为私密",
+        }
+        return
+    total = len(awemes)
+    truncated = bool(has_more)
+    logger.info(
+        "主页解析开始 source=%s sec_user_id=%s cursor=%s total=%s has_more=%s next_cursor=%s",
+        source_url,
+        sec_user_id[:16],
+        cursor,
+        total,
+        has_more,
+        next_cursor,
+    )
+    page_meta = {
+        "mode": "user",
+        "truncated": truncated,
+        "has_more": has_more,
+        "sec_user_id": sec_user_id,
+        "next_cursor": next_cursor,
+    }
+    yield {"event": "start", "total": total, **page_meta}
+    async for index, item in iter_parse_user_awemes(awemes, html_client, cookie):
+        yield {"event": "item", "index": index, "total": total, "item": item}
+    yield {"event": "done", "total": total, **page_meta}
+
+
+def validate_sec_user_id(sec_user_id: str) -> str:
+    ident = (sec_user_id or "").strip()
+    if not ident or not _SEC_USER_ID_RE.fullmatch(ident):
+        raise ParseError("用户 ID 无效")
+    return ident
+
+
+async def iter_parse_user_more(sec_user_id: str, cursor: int):
+    """从指定 cursor 继续拉主页下一页。"""
+    ident = validate_sec_user_id(sec_user_id)
+    try:
+        start_cursor = int(cursor or 0)
+    except (TypeError, ValueError):
+        raise ParseError("翻页参数无效")
+    if start_cursor < 0:
+        raise ParseError("翻页参数无效")
+    cookie = config.load_cookie()
+    html_client = _make_html_client(config.HTTP_TIMEOUT)
+    try:
+        async for event in _iter_user_job(html_client, cookie, "", ident, start_cursor):
+            yield event
+    finally:
+        await _close_http_client(html_client)
+
+
+async def iter_parse_job(urls: list[str]):
+    """解析任务事件流：listing? / error / start / item* / done。"""
+    peek_user = next((u for u in urls if _peek_link_kind(u) == "user"), None)
+    need_resolve = (
+        peek_user is None
+        and len(urls) == 1
+        and _peek_link_kind(urls[0]) == "unknown"
+    )
+    if peek_user or need_resolve:
+        cookie = config.load_cookie()
+        html_client = _make_html_client(config.HTTP_TIMEOUT)
+        try:
+            if peek_user:
+                sec_user_id = _sec_user_id_from(peek_user)
+                if not sec_user_id:
+                    yield {"event": "error", "message": "无法从主页链接中获取用户 ID"}
+                    return
+                async for event in _iter_user_job(html_client, cookie, peek_user, sec_user_id):
+                    yield event
+                return
+            try:
+                kind, ident = await _resolve_link(html_client, urls[0], cookie)
+            except ParseError as exc:
+                yield {"event": "error", "message": str(exc)}
+                return
+            if kind == "user":
+                async for event in _iter_user_job(html_client, cookie, urls[0], ident):
+                    yield event
+                return
+        finally:
+            await _close_http_client(html_client)
+
+    total = len(urls)
+    yield {"event": "start", "total": total, "mode": "video"}
+    async for index, item in iter_parse_urls(urls):
+        yield {"event": "item", "index": index, "total": total, "item": item}
+    yield {"event": "done", "total": total, "mode": "video"}
 
 
 async def parse_urls(urls: list[str]) -> list[ParseItem]:

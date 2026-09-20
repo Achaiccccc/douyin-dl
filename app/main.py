@@ -56,6 +56,11 @@ class ParseOneBody(BaseModel):
     url: str
 
 
+class ParseMoreBody(BaseModel):
+    sec_user_id: str
+    cursor: int = 0
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
     # no-cache：保证部署新版本后浏览器能拿到最新页面（静态资源用 ?v= 做缓存穿透）
@@ -127,23 +132,46 @@ def _item_to_json(item: parser.ParseItem) -> dict:
     return payload
 
 
+def _ndjson_line(event: dict) -> str:
+    if event.get("event") == "item":
+        data = _item_to_json(event["item"])
+        data["event"] = "item"
+        data["index"] = event["index"]
+        data["total"] = event["total"]
+        return json.dumps(data, ensure_ascii=False) + "\n"
+    payload = {key: value for key, value in event.items() if key != "item"}
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
 @app.post("/api/parse", dependencies=[Depends(auth.require_auth)])
 async def api_parse(body: ParseBody) -> StreamingResponse:
     try:
         urls = parser.extract_urls(body.text)
     except parser.ParseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
-    total = len(urls)
 
     async def stream():
-        yield json.dumps({"event": "start", "total": total}, ensure_ascii=False) + "\n"
-        async for index, item in parser.iter_parse_urls(urls):
-            data = _item_to_json(item)
-            data["event"] = "item"
-            data["index"] = index
-            data["total"] = total
-            yield json.dumps(data, ensure_ascii=False) + "\n"
-        yield json.dumps({"event": "done", "total": total}, ensure_ascii=False) + "\n"
+        async for event in parser.iter_parse_job(urls):
+            yield _ndjson_line(event)
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/api/parse_more", dependencies=[Depends(auth.require_auth)])
+async def api_parse_more(body: ParseMoreBody) -> StreamingResponse:
+    try:
+        parser.validate_sec_user_id(body.sec_user_id)
+        cursor = int(body.cursor or 0)
+    except parser.ParseError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="翻页参数无效")
+    if cursor < 0:
+        raise HTTPException(status_code=400, detail="翻页参数无效")
+
+    async def stream():
+        async for event in parser.iter_parse_user_more(body.sec_user_id, cursor):
+            yield _ndjson_line(event)
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 

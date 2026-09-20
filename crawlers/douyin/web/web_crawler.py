@@ -277,9 +277,9 @@ def apply_secsdk_web_sign(url: str, uifid: str, now: int | None = None) -> tuple
     }
 
 
-def _params_dict(aweme_id: str, profile: BrowserProfile, ms_token: str, cookie: str = "") -> dict:
-    params = PostDetail(aweme_id=aweme_id)
-    data = params.dict() if hasattr(params, "dict") else params.model_dump()
+def _apply_browser_and_tokens(
+    data: dict, profile: BrowserProfile, ms_token: str, cookie: str = ""
+) -> dict:
     data["msToken"] = ms_token
     data["browser_version"] = profile.browser_version
     data["engine_version"] = profile.engine_version
@@ -294,6 +294,42 @@ def _params_dict(aweme_id: str, profile: BrowserProfile, ms_token: str, cookie: 
         data["verifyFp"] = verify_fp
         data["fp"] = verify_fp
     return data
+
+
+def _params_dict(aweme_id: str, profile: BrowserProfile, ms_token: str, cookie: str = "") -> dict:
+    params = PostDetail(aweme_id=aweme_id)
+    data = params.dict() if hasattr(params, "dict") else params.model_dump()
+    return _apply_browser_and_tokens(data, profile, ms_token, cookie)
+
+
+def _user_post_params_dict(
+    sec_user_id: str,
+    max_cursor: int,
+    count: int,
+    profile: BrowserProfile,
+    ms_token: str,
+    cookie: str = "",
+) -> dict:
+    params = UserPost(sec_user_id=sec_user_id, max_cursor=max_cursor, count=count)
+    data = params.dict() if hasattr(params, "dict") else params.model_dump()
+    return _apply_browser_and_tokens(data, profile, ms_token, cookie)
+
+
+def _web_api_headers(cookie: str, profile: BrowserProfile, has_cffi: bool) -> dict[str, str]:
+    uifid, _source = resolve_uifid(cookie)
+    headers = {
+        "Referer": "https://www.douyin.com/",
+        "Origin": "https://www.douyin.com",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    if uifid:
+        headers["uifid"] = uifid
+    if not has_cffi:
+        headers["User-Agent"] = profile.ua
+    return headers
 
 
 async def fetch_aweme_detail(
@@ -311,18 +347,7 @@ async def fetch_aweme_detail(
     uifid, uifid_source = resolve_uifid(cookie)
     if not uifid:
         logger.warning("uifid 为空（cookie 无 UIFID / UIFID_TEMP），Argus 会直接 403")
-    headers = {
-        "Referer": "https://www.douyin.com/",
-        "Origin": "https://www.douyin.com",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-    }
-    if cookie:
-        headers["Cookie"] = cookie
-    if uifid:
-        headers["uifid"] = uifid
-    if not has_cffi:
-        headers["User-Agent"] = profile.ua
+    headers = _web_api_headers(cookie, profile, has_cffi)
 
     last_status = None
     last_kind = "empty"
@@ -429,6 +454,150 @@ async def fetch_aweme_detail(
     if last_kind == "connect":
         raise WebApiError("connect", "无法连接抖音服务器，请检查 NAS 网络后重试", last_status)
     raise WebApiError(last_kind, "最高清晰度接口未返回作品数据", last_status)
+
+
+async def fetch_user_post_page(
+    sec_user_id: str,
+    max_cursor: int,
+    count: int,
+    cookie: str,
+    client,
+    has_cffi: bool,
+    profile: BrowserProfile | None = None,
+) -> dict:
+    """请求 aweme/post 一页。签名与 aweme/detail 相同：httpx + 真 msToken + a_bogus + webSign。"""
+    profile = profile or active_profile(has_cffi)
+    ms_token, ms_source = resolve_ms_token(cookie)
+    if not ms_token:
+        logger.warning("msToken 为空（cookie 无此字段且生成失败），禁止再写死空串之外已无值可填")
+    uifid, uifid_source = resolve_uifid(cookie)
+    if not uifid:
+        logger.warning("uifid 为空（cookie 无 UIFID / UIFID_TEMP），Argus 会直接 403")
+    headers = _web_api_headers(cookie, profile, has_cffi)
+
+    last_status = None
+    last_kind = "empty"
+    for attempt in range(1, WEB_API_ATTEMPTS + 1):
+        params_dict = _user_post_params_dict(
+            sec_user_id, max_cursor, count, profile, ms_token, cookie
+        )
+        a_bogus = BogusManager.ab_model_2_endpoint(params_dict, profile.ua)
+        endpoint = f"{DouyinAPIEndpoints.USER_POST}?{urlencode(params_dict)}&a_bogus={a_bogus}"
+        req_headers = dict(headers)
+        web_sign = "no"
+        if uifid:
+            endpoint, sign_headers = apply_secsdk_web_sign(endpoint, uifid)
+            req_headers.update(sign_headers)
+            web_sign = "md5"
+        logger.info(
+            "Web API 主页列表 sec_user_id=%s cursor=%s count=%s client=%s msToken_source=%s uifid_source=%s uifid_len=%s a_bogus_len=%s web_sign=%s attempt=%s/%s",
+            sec_user_id[:16],
+            max_cursor,
+            count,
+            "curl_cffi" if has_cffi else "httpx",
+            ms_source,
+            uifid_source,
+            len(uifid),
+            len(a_bogus),
+            web_sign,
+            attempt,
+            WEB_API_ATTEMPTS,
+        )
+        try:
+            resp = await client.get(endpoint, headers=req_headers)
+        except Exception as exc:
+            last_kind = "connect"
+            logger.warning(
+                "Web API 主页列表请求失败 client=%s attempt=%s: %s",
+                "curl_cffi" if has_cffi else "httpx",
+                attempt,
+                exc,
+            )
+            if attempt == WEB_API_ATTEMPTS:
+                raise WebApiError("connect", "无法连接抖音服务器，请检查 NAS 网络后重试")
+            continue
+
+        last_status = getattr(resp, "status_code", None)
+        text = resp.text or ""
+        if last_status == 403:
+            last_kind = "forbidden"
+            logger.warning(
+                "Web API 主页列表 403 client=%s attempt=%s %s",
+                "curl_cffi" if has_cffi else "httpx",
+                attempt,
+                _body_hint(text),
+            )
+            continue
+        if last_status != 200:
+            last_kind = "http"
+            logger.warning(
+                "Web API 主页列表 HTTP %s client=%s attempt=%s %s",
+                last_status,
+                "curl_cffi" if has_cffi else "httpx",
+                attempt,
+                _body_hint(text),
+            )
+            continue
+        if not text.strip():
+            last_kind = "empty"
+            logger.warning(
+                "Web API 主页列表空包 client=%s attempt=%s",
+                "curl_cffi" if has_cffi else "httpx",
+                attempt,
+            )
+            continue
+        if _looks_html(text):
+            last_kind = "forbidden"
+            logger.warning(
+                "Web API 主页列表返回验证页 HTML client=%s attempt=%s %s",
+                "curl_cffi" if has_cffi else "httpx",
+                attempt,
+                _html_hint(text),
+            )
+            continue
+        try:
+            payload = resp.json()
+        except Exception:
+            last_kind = "empty"
+            logger.warning(
+                "Web API 主页列表非 JSON client=%s attempt=%s prefix=%r",
+                "curl_cffi" if has_cffi else "httpx",
+                attempt,
+                text[:80],
+            )
+            continue
+        if not isinstance(payload, dict):
+            last_kind = "empty"
+            continue
+        aweme_list = payload.get("aweme_list")
+        if not isinstance(aweme_list, list):
+            aweme_list = []
+        status = payload.get("status_code")
+        if status not in (None, 0, "0") and not aweme_list:
+            last_kind = "empty"
+            logger.warning(
+                "Web API 主页列表业务失败 client=%s attempt=%s status_code=%s keys=%s",
+                "curl_cffi" if has_cffi else "httpx",
+                attempt,
+                status,
+                list(payload.keys())[:8],
+            )
+            continue
+        payload["aweme_list"] = aweme_list
+        logger.info(
+            "Web API 主页列表成功 sec_user_id=%s cursor=%s page=%s has_more=%s",
+            sec_user_id[:16],
+            max_cursor,
+            len(aweme_list),
+            payload.get("has_more"),
+        )
+        return payload
+
+    if last_kind == "forbidden":
+        raise WebApiError("forbidden", "抖音风控拦截了主页作品列表（HTTP 403）", last_status)
+    if last_kind == "connect":
+        raise WebApiError("connect", "无法连接抖音服务器，请检查 NAS 网络后重试", last_status)
+    raise WebApiError(last_kind, "主页作品列表接口未返回数据", last_status)
 
 
 class DouyinWebCrawler:

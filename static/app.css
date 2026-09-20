@@ -162,6 +162,16 @@ textarea:focus {
   text-align: center;
 }
 
+.result-actions {
+  margin-top: 8px;
+  margin-bottom: 16px;
+}
+
+#view-result > #btn-again {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
 .result-list {
   display: flex;
   flex-direction: column;
