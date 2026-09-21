@@ -54,7 +54,6 @@ _RENDER_DATA_RE = re.compile(
     r'<script id="RENDER_DATA" type="application/json">(.*?)</script>', re.DOTALL
 )
 
-MAX_BATCH = 30
 MAX_USER_POSTS = 100
 USER_POST_PAGE_SIZE = 18
 MAX_CONCURRENCY = 2
@@ -161,8 +160,8 @@ def extract_urls(text: str) -> list[str]:
             result.append(url)
     if not result:
         raise ParseError("无法识别抖音链接，请粘贴包含链接的分享文案")
-    if len(result) > MAX_BATCH:
-        raise ParseError(f"一次最多解析 {MAX_BATCH} 条链接，请分批粘贴")
+    if len(result) > config.MAX_BATCH:
+        raise ParseError(f"一次最多解析 {config.MAX_BATCH} 条链接，请分批粘贴")
     return result
 
 

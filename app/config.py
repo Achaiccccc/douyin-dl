@@ -25,6 +25,8 @@ else:
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "600"))
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "15"))
 DOWNLOAD_TIMEOUT = float(os.environ.get("DOWNLOAD_TIMEOUT", "120"))
+# 一次粘贴最多解析多少条作品链接；改 compose 后重建容器即可生效，无需改代码
+MAX_BATCH = int(os.environ.get("MAX_BATCH", "30"))
 # 复用已部署的 evil0ctal 解析引擎。例：http://host.docker.internal:36933
 UPSTREAM_API = os.environ.get("UPSTREAM_API", "").strip().rstrip("/")
 UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "45"))
