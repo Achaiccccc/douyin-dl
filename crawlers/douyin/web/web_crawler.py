@@ -439,7 +439,19 @@ async def fetch_aweme_detail(
             continue
         video = detail.get("video") if isinstance(detail.get("video"), dict) else {}
         bit_rate = video.get("bit_rate")
-        if not isinstance(bit_rate, list) or not bit_rate:
+        images = detail.get("images")
+        image_count = len(images) if isinstance(images, list) else 0
+        has_bit_rate = isinstance(bit_rate, list) and bool(bit_rate)
+        # 图集 / 图文没有视频码率列表，但 images 已是可下载原图
+        if image_count and not has_bit_rate:
+            logger.info(
+                "Web API 成功 aweme_id=%s client=%s 图文 images=%s",
+                aweme_id,
+                "curl_cffi" if has_cffi else "httpx",
+                image_count,
+            )
+            return payload
+        if not has_bit_rate:
             raise WebApiError("no_bit_rate", "详情接口未返回清晰度列表", last_status)
         logger.info(
             "Web API 成功 aweme_id=%s client=%s bit_rate档数=%s",

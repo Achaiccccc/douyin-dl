@@ -44,7 +44,8 @@ DESKTOP_UA = (
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]*douyin\.com/[^\s\"'<>，。！；）】]*")
 _BARE_SHORT_RE = re.compile(r"v\.douyin\.com/[A-Za-z0-9_-]+/?")
-_AWEME_RE = re.compile(r"/(?:video|note)/(\d{6,})")
+# 图集短链会 302 到 /share/slides/{id}，作品 ID 与视频、笔记相同
+_AWEME_RE = re.compile(r"/(?:video|note|slides)/(\d{6,})")
 _MODAL_RE = re.compile(r"[?&]modal_id=(\d{6,})")
 _USER_PATH_RE = re.compile(r"/(?:share/)?user/([^/?#]+)")
 _SEC_UID_RE = re.compile(r"[?&]sec_uid=([^&]+)")

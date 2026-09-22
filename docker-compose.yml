@@ -11,6 +11,6 @@ services:
       APP_PASSWORD: "123456"
       COOKIE_FILE: /data/cookie.txt
       # 一次粘贴最多解析多少条作品链接；改完后 docker compose up -d 重建容器即可
-      MAX_BATCH: "30"
+      MAX_BATCH: "50"
     volumes:
       - ./data/cookie.txt:/data/cookie.txt:ro
